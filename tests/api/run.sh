@@ -413,6 +413,7 @@ HURL_FILES=( \
   "$API_DIR/webdav_patch_consistency.hurl" \
   "$API_DIR/nc_webdav_patch_consistency.hurl" \
   "$API_DIR/nc_webdav_put_gaps.hurl" \
+  "$API_DIR/nc_chunked_assemble_fileid.hurl" \
   "$API_DIR/webdav_drive_root.hurl" \
   "$API_DIR/webdav_permissions.hurl" \
   "$API_DIR/webdav_nested_move_cascade.hurl" \
