@@ -106,6 +106,19 @@ impl NextcloudFileIdService {
         format!("{:08}{}", id, self.instance_id)
     }
 
+    /// The `oc:id` (`{:08}{instance_id}`) of one file, creating its numeric
+    /// mapping when absent. This is the value NextCloud clients expect in the
+    /// `OC-FileId` response header after an upload, and they compare it with
+    /// the `oc:id` a later PROPFIND reports for the same file, so both must
+    /// come from this one mapping. `Ok(None)` when `file_id` is not a UUID.
+    pub async fn oc_id_for_file(&self, file_id: &str) -> Result<Option<String>> {
+        let ids = self.get_or_create_file_ids(&[file_id]).await?;
+        Ok(Uuid::parse_str(file_id)
+            .ok()
+            .and_then(|uuid| ids.get(&uuid).copied())
+            .map(|id| self.format_oc_id(id)))
+    }
+
     pub fn instance_id(&self) -> &str {
         &self.instance_id
     }
@@ -181,5 +194,24 @@ mod tests {
         let svc = NextcloudFileIdService::new_stub();
         let map = svc.get_or_create_file_ids(&["not-a-uuid"]).await.unwrap();
         assert!(map.is_empty());
+    }
+
+    // `OC-FileId` on the chunked-assemble MOVE is built here. The NextCloud
+    // desktop client journals that header and compares it with PROPFIND's
+    // `oc:id`, so it must be the same `{:08}{instance_id}` string, never the
+    // bare numeric `oc:fileid`. A warm cache entry answers without the repo.
+    #[tokio::test]
+    async fn test_oc_id_for_file_uses_oc_id_format() {
+        let svc = NextcloudFileIdService::new_test("myinst");
+        let uuid = Uuid::new_v4();
+        svc.cache.insert(uuid, 42).await;
+        let oc_id = svc.oc_id_for_file(&uuid.to_string()).await.unwrap();
+        assert_eq!(oc_id.as_deref(), Some("00000042myinst"));
+    }
+
+    #[tokio::test]
+    async fn test_oc_id_for_file_none_for_unparseable() {
+        let svc = NextcloudFileIdService::new_stub();
+        assert_eq!(svc.oc_id_for_file("not-a-uuid").await.unwrap(), None);
     }
 }

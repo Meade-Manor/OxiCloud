@@ -490,24 +490,39 @@ async fn handle_assemble(
             return Err(AppError::from(e));
         }
     };
+    // The NextCloud desktop client aborts a chunked upload with "Missing File
+    // ID from server" when this MOVE answers without `OC-FileId`
+    // (`PropagateUploadFileNG::slotMoveJobFinished`), and then retries it on
+    // every sync although the file has landed. NextCloud sends the file's
+    // `oc:id` here, and so do we. The file is already stored, so a failed
+    // lookup only drops the header: the client then retries, as it did
+    // before this header existed.
+    let oc_file_id = match nc.file_ids.oc_id_for_file(&dto.id).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                file_id = %dto.id,
+                error = %e,
+                "⚠️ could not resolve oc:id for OC-FileId after chunked assemble"
+            );
+            None
+        }
+    };
     let etag: Option<String> = Some(dto.etag);
 
     // Cleanup session.
     let _ = nc.chunked_uploads.cleanup(&user.username, upload_id).await;
 
+    let mut response = Response::builder().status(StatusCode::CREATED);
     if let Some(tag) = etag {
-        return Ok(Response::builder()
-            .status(StatusCode::CREATED)
+        response = response
             .header(header::ETAG, format!("\"{}\"", tag))
-            .header("oc-etag", format!("\"{}\"", tag))
-            .body(Body::empty())
-            .unwrap());
+            .header("oc-etag", format!("\"{}\"", tag));
     }
-
-    Ok(Response::builder()
-        .status(StatusCode::CREATED)
-        .body(Body::empty())
-        .unwrap())
+    if let Some(id) = oc_file_id {
+        response = response.header("oc-fileid", id);
+    }
+    Ok(response.body(Body::empty()).unwrap())
 }
 
 /// DELETE — abort an upload session.
