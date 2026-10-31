@@ -3,7 +3,8 @@
 # fresh OxiCloud: a 30 MiB file goes up as three 10 MiB chunks, a second sync
 # must find nothing to do, and a second folder must download the same bytes.
 # On stock 0.9.3 the first sync fails with "Missing File ID from server" and
-# every later sync uploads the file again.
+# every later sync uploads the file again; 0.10.0 still answers that MOVE
+# without OC-FileId.
 #
 # Usage: client-sync-check.sh <base-url> <work-dir>
 # The server must be new: this creates its first admin account. Test data only.
