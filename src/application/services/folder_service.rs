@@ -3,8 +3,8 @@ use crate::application::dtos::drive_dto::DriveKindDto;
 use crate::application::dtos::folder_dto::{
     AccessSourceDriveDto, AccessSourceDto, AccessSourceKind, AccessSourceSubjectDto,
     AccessSourceSubjectKind, CreateFolderDto, EffectiveLinkDto, FolderAncestorDto,
-    FolderAncestorsDto, FolderDto, FolderResourceCursor, FolderResourceRow, ListResourcesOptions,
-    MoveFolderDto, RenameFolderDto,
+    FolderAncestorsDto, FolderDto, FolderOrderBy, FolderResourceCursor, FolderResourceRow,
+    ListResourcesOptions, MoveFolderDto, RenameFolderDto,
 };
 use crate::application::dtos::grant_dto::{GrantDto, RoleDto};
 use crate::application::ports::authorization_ports::AuthorizationEngine;
@@ -332,7 +332,14 @@ impl FolderUseCase for FolderService {
         permission: Permission,
         folder_id: &str,
     ) -> Result<Subject, DomainError> {
-        let resource = Self::folder_resource(folder_id)?;
+        // Mount ids (root UUID and `ext:` children) authorise against the
+        // mount-root folder grant (#793) — the REST prechecks on folder
+        // listing, folder metadata and uploads into a mount subfolder all
+        // pass through here.
+        let resource = self
+            .mount_router
+            .folder_authz_resource(folder_id)
+            .ok_or_else(|| DomainError::not_found("Folder", folder_id))?;
         self.authz.require_any(callers, permission, resource).await
     }
 
@@ -446,6 +453,20 @@ impl FolderUseCase for FolderService {
         id: &str,
         caller: Subject,
     ) -> Result<FolderDto, DomainError> {
+        // An `ext:` mount directory has no `storage.folders` row: authorise
+        // on the mount root and stat it on the provider (#793). The mount
+        // root itself is a real row and falls through.
+        if let ResolvedId::MountChild { cfg, node_id } = self.mount_router.classify(id) {
+            self.authz
+                .require(caller, Permission::Read, Resource::Folder(cfg.mount_id))
+                .await?;
+            let stat = cfg.provider.stat(&node_id).await?;
+            if !stat.is_dir {
+                return Err(DomainError::not_found("Folder", id));
+            }
+            let parent = mount_parent_id(&cfg, stat.node_id.as_str());
+            return Ok(mount_folder_dto(&cfg, &parent, &stat));
+        }
         self.authz
             .require(caller, Permission::Read, Self::folder_resource(id)?)
             .await?;
@@ -594,6 +615,42 @@ impl FolderUseCase for FolderService {
         after_name: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FolderDto>, DomainError> {
+        // External mount: list subdirectories from the provider. This is the
+        // folder half of the WebDAV / NextCloud PROPFIND Depth:1 loop; the file
+        // half lives in `FileRetrievalService::list_files_batch_with_perms` and
+        // already branched here. The keyset refactor dropped this branch from
+        // the batch path (#792) — Depth:1 on a mount listed files but no
+        // directories. Authz collapses on the mount root; provider order is
+        // not guaranteed, so sort before slicing on `after_name`.
+        if let Some(pid) = parent_id
+            && let Some((cfg, node)) = self.mount_node_for(pid)
+        {
+            self.require_mount_perm(&cfg, Permission::Read, caller_id)
+                .await?;
+            let mut dirs: Vec<_> = cfg
+                .provider
+                .list_dir(&node)
+                .await?
+                .into_iter()
+                .filter(|e| e.is_dir)
+                .collect();
+            dirs.sort_by_key(|e| e.name.to_lowercase());
+            let start = match after_name {
+                Some(name) => dirs
+                    .iter()
+                    .position(|e| name.eq_ignore_ascii_case(&e.name))
+                    .map(|i| i + 1)
+                    .unwrap_or(0),
+                None => 0,
+            };
+            return Ok(dirs
+                .into_iter()
+                .skip(start)
+                .take(limit)
+                .map(|e| mount_entry_folder_dto(&cfg, pid, &e))
+                .collect());
+        }
+
         match parent_id {
             Some(pid) => {
                 self.authz
@@ -1516,7 +1573,7 @@ impl FolderService {
 fn paginate_mount_entries(
     mut entries: Vec<MountEntry>,
     kinds: Option<&[ResourceKind]>,
-    order_by: &str,
+    order_by: FolderOrderBy,
     reverse: bool,
     limit: usize,
     cursor_name: Option<&str>,
@@ -1563,16 +1620,20 @@ fn paginate_mount_entries(
 /// Sort mount entries in place. Folders sort before files for the `name`/`type`
 /// dimensions; otherwise by the requested key with name as the tie-breaker.
 /// `reverse` flips the final order.
-fn sort_mount_entries(entries: &mut [MountEntry], order_by: &str, reverse: bool) {
+fn sort_mount_entries(entries: &mut [MountEntry], order_by: FolderOrderBy, reverse: bool) {
     use std::cmp::Ordering;
     let name_key = |e: &MountEntry| e.name.to_lowercase();
     entries.sort_by(|a, b| {
         let primary = match order_by {
-            "modified_at" => a.modified_at.cmp(&b.modified_at),
-            "created_at" => a.created_at.cmp(&b.created_at),
-            "size" => a.size.cmp(&b.size),
-            // "name" / "type" / anything else: folders first, then by name.
-            _ => b.is_dir.cmp(&a.is_dir),
+            FolderOrderBy::ModifiedAt => a.modified_at.cmp(&b.modified_at),
+            FolderOrderBy::CreatedAt => a.created_at.cmp(&b.created_at),
+            FolderOrderBy::Size => a.size.cmp(&b.size),
+            // `name` and `type` both mean folders first, then by name —
+            // an external mount exposes no category to order by, so the
+            // two collapse here. Spelled out rather than left as `_` so a
+            // new axis is a compile error that must decide what a mount
+            // listing should do with it.
+            FolderOrderBy::Name | FolderOrderBy::Type => b.is_dir.cmp(&a.is_dir),
         };
         let ord = primary.then_with(|| name_key(a).cmp(&name_key(b)));
         if ord == Ordering::Equal {
@@ -1589,51 +1650,37 @@ fn sort_mount_entries(entries: &mut [MountEntry], order_by: &str, reverse: bool)
 /// `reverse` is stored in the cursor so subsequent pages use the same order.
 fn build_folder_resource_cursor(
     row: &FolderResourceRow,
-    order_by: &str,
+    order_by: FolderOrderBy,
     reverse: bool,
 ) -> FolderResourceCursor {
-    match order_by {
-        "type" => FolderResourceCursor {
-            order_by: "type".to_owned(),
-            resource_id: row.id,
-            sort_str: Some(row.sort_str.clone()),
-            sort_int: Some(row.type_order),
-            sort_ts: None,
-            reverse,
-        },
-        "modified_at" => FolderResourceCursor {
-            order_by: "modified_at".to_owned(),
-            resource_id: row.id,
-            sort_str: None,
-            sort_int: None,
-            sort_ts: Some(row.modified_at),
-            reverse,
-        },
-        "created_at" => FolderResourceCursor {
-            order_by: "created_at".to_owned(),
-            resource_id: row.id,
-            sort_str: None,
-            sort_int: None,
-            sort_ts: Some(row.created_at),
-            reverse,
-        },
-        "size" => FolderResourceCursor {
-            order_by: "size".to_owned(),
-            resource_id: row.id,
-            sort_str: None,
-            sort_int: Some(row.size),
-            sort_ts: None,
-            reverse,
-        },
-        _ => FolderResourceCursor {
-            // "name" (default): sort_int = folder_first (0 or 1)
-            order_by: "name".to_owned(),
-            resource_id: row.id,
-            sort_str: Some(row.sort_str.clone()),
-            sort_int: Some(i64::from(row.folder_first)),
-            sort_ts: None,
-            reverse,
-        },
+    // §7: exhaustive on `FolderOrderBy`, no catch-all. The `_` arm this
+    // replaced doubled as the `name` default AND the unknown-axis case, so
+    // an invalid axis minted a name cursor whose sort_int held
+    // `folder_first` while the repository ordered by something else — the
+    // keyset/ORDER BY mismatch §2 fixed on this very endpoint.
+    //
+    // Only the three sort-field slots vary; the axis is just the (Copy)
+    // parameter, where each arm used to re-spell it as a literal that
+    // could drift from the arm matching it.
+    let (sort_str, sort_int, sort_ts) = match order_by {
+        // sort_int = folder_first (0 = folder, 1 = file)
+        FolderOrderBy::Name => (
+            Some(row.sort_str.clone()),
+            Some(i64::from(row.folder_first)),
+            None,
+        ),
+        FolderOrderBy::Type => (Some(row.sort_str.clone()), Some(row.type_order), None),
+        FolderOrderBy::ModifiedAt => (None, None, Some(row.modified_at)),
+        FolderOrderBy::CreatedAt => (None, None, Some(row.created_at)),
+        FolderOrderBy::Size => (None, Some(row.size), None),
+    };
+    FolderResourceCursor {
+        order_by,
+        resource_id: row.id,
+        sort_str,
+        sort_int,
+        sort_ts,
+        reverse,
     }
 }
 
@@ -1839,7 +1886,7 @@ impl UserLifecycleHook for PersonalDriveLifecycleHook {
 mod mount_listing_tests {
     use super::{paginate_mount_entries, sort_mount_entries};
     use crate::application::dtos::cursor::PageCursor;
-    use crate::application::dtos::folder_dto::FolderResourceCursor;
+    use crate::application::dtos::folder_dto::{FolderOrderBy, FolderResourceCursor};
     use crate::application::ports::external_mount_ports::MountEntry;
     use crate::domain::services::authorization::ResourceKind;
     use crate::domain::services::external_mount_id::NodeId;
@@ -1867,7 +1914,7 @@ mod mount_listing_tests {
             entry("Cherry", true, 0, 1),
             entry("almond.txt", false, 1, 1),
         ];
-        sort_mount_entries(&mut e, "name", false);
+        sort_mount_entries(&mut e, FolderOrderBy::Name, false);
         assert_eq!(names(&e), ["apple", "Cherry", "almond.txt", "Banana.txt"]);
     }
 
@@ -1878,7 +1925,7 @@ mod mount_listing_tests {
             entry("b", false, 1, 1),
             entry("d", true, 0, 1),
         ];
-        sort_mount_entries(&mut e, "name", true);
+        sort_mount_entries(&mut e, FolderOrderBy::Name, true);
         // folders-first then name, reversed.
         assert_eq!(names(&e), ["b", "a", "d"]);
     }
@@ -1890,7 +1937,7 @@ mod mount_listing_tests {
             entry("small", false, 1, 1),
             entry("mid", false, 50, 1),
         ];
-        sort_mount_entries(&mut by_size, "size", false);
+        sort_mount_entries(&mut by_size, FolderOrderBy::Size, false);
         assert_eq!(names(&by_size), ["small", "mid", "big"]);
 
         let mut by_mtime = vec![
@@ -1898,25 +1945,31 @@ mod mount_listing_tests {
             entry("old", false, 1, 100),
             entry("mid", false, 1, 200),
         ];
-        sort_mount_entries(&mut by_mtime, "modified_at", false);
+        sort_mount_entries(&mut by_mtime, FolderOrderBy::ModifiedAt, false);
         assert_eq!(names(&by_mtime), ["old", "mid", "new"]);
 
         let mut by_ctime = vec![entry("z", false, 1, 9), entry("a", false, 1, 5)];
-        sort_mount_entries(&mut by_ctime, "created_at", false);
+        sort_mount_entries(&mut by_ctime, FolderOrderBy::CreatedAt, false);
         assert_eq!(names(&by_ctime), ["a", "z"]);
     }
 
     #[test]
     fn filters_by_kind() {
         let make = || vec![entry("dir", true, 0, 1), entry("file.txt", false, 1, 1)];
-        let (files_only, _) =
-            paginate_mount_entries(make(), Some(&[ResourceKind::File]), "name", false, 50, None);
+        let (files_only, _) = paginate_mount_entries(
+            make(),
+            Some(&[ResourceKind::File]),
+            FolderOrderBy::Name,
+            false,
+            50,
+            None,
+        );
         assert_eq!(names(&files_only), ["file.txt"]);
 
         let (folders_only, _) = paginate_mount_entries(
             make(),
             Some(&[ResourceKind::Folder]),
-            "name",
+            FolderOrderBy::Name,
             false,
             50,
             None,
@@ -1926,7 +1979,7 @@ mod mount_listing_tests {
         let (both, _) = paginate_mount_entries(
             make(),
             Some(&[ResourceKind::File, ResourceKind::Folder]),
-            "name",
+            FolderOrderBy::Name,
             false,
             50,
             None,
@@ -1947,7 +2000,7 @@ mod mount_listing_tests {
         };
 
         // Page 1: limit 2 → [a, b], cursor present.
-        let (p1, c1) = paginate_mount_entries(all(), None, "name", false, 2, None);
+        let (p1, c1) = paginate_mount_entries(all(), None, FolderOrderBy::Name, false, 2, None);
         assert_eq!(names(&p1), ["a", "b"]);
         let c1 = c1.expect("cursor after first page");
         let decoded = FolderResourceCursor::decode(&c1).expect("decodes");
@@ -1955,12 +2008,14 @@ mod mount_listing_tests {
         assert!(!decoded.reverse);
 
         // Page 2: resume after "b" → [c, d], cursor present.
-        let (p2, c2) = paginate_mount_entries(all(), None, "name", false, 2, Some("b"));
+        let (p2, c2) =
+            paginate_mount_entries(all(), None, FolderOrderBy::Name, false, 2, Some("b"));
         assert_eq!(names(&p2), ["c", "d"]);
         assert!(c2.is_some());
 
         // Page 3: resume after "d" → [e], no further cursor.
-        let (p3, c3) = paginate_mount_entries(all(), None, "name", false, 2, Some("d"));
+        let (p3, c3) =
+            paginate_mount_entries(all(), None, FolderOrderBy::Name, false, 2, Some("d"));
         assert_eq!(names(&p3), ["e"]);
         assert!(c3.is_none());
     }
@@ -1968,7 +2023,7 @@ mod mount_listing_tests {
     #[test]
     fn no_cursor_when_page_is_last() {
         let e = vec![entry("a", false, 1, 1), entry("b", false, 1, 1)];
-        let (page, cursor) = paginate_mount_entries(e, None, "name", false, 50, None);
+        let (page, cursor) = paginate_mount_entries(e, None, FolderOrderBy::Name, false, 50, None);
         assert_eq!(page.len(), 2);
         assert!(cursor.is_none());
     }
@@ -1977,13 +2032,15 @@ mod mount_listing_tests {
     fn deleted_cursor_entry_restarts_best_effort() {
         // Cursor names "zzz" which is not present → start from the top.
         let e = vec![entry("a", false, 1, 1), entry("b", false, 1, 1)];
-        let (page, _) = paginate_mount_entries(e, None, "name", false, 50, Some("zzz"));
+        let (page, _) =
+            paginate_mount_entries(e, None, FolderOrderBy::Name, false, 50, Some("zzz"));
         assert_eq!(names(&page), ["a", "b"]);
     }
 
     #[test]
     fn empty_directory_yields_empty_page() {
-        let (page, cursor) = paginate_mount_entries(vec![], None, "name", false, 50, None);
+        let (page, cursor) =
+            paginate_mount_entries(vec![], None, FolderOrderBy::Name, false, 50, None);
         assert!(page.is_empty());
         assert!(cursor.is_none());
     }
@@ -1991,7 +2048,7 @@ mod mount_listing_tests {
     #[test]
     fn limit_larger_than_len_returns_all_without_cursor() {
         let e = vec![entry("a", false, 1, 1), entry("b", false, 1, 1)];
-        let (page, cursor) = paginate_mount_entries(e, None, "name", false, 100, None);
+        let (page, cursor) = paginate_mount_entries(e, None, FolderOrderBy::Name, false, 100, None);
         assert_eq!(page.len(), 2);
         assert!(cursor.is_none());
     }
@@ -1999,8 +2056,14 @@ mod mount_listing_tests {
     #[test]
     fn kind_filter_excluding_all_yields_empty() {
         let e = vec![entry("only_dir", true, 0, 1)];
-        let (page, cursor) =
-            paginate_mount_entries(e, Some(&[ResourceKind::File]), "name", false, 50, None);
+        let (page, cursor) = paginate_mount_entries(
+            e,
+            Some(&[ResourceKind::File]),
+            FolderOrderBy::Name,
+            false,
+            50,
+            None,
+        );
         assert!(page.is_empty());
         assert!(cursor.is_none());
     }
@@ -2012,17 +2075,17 @@ mod mount_listing_tests {
             entry("b", false, 1, 1),
             entry("c", false, 1, 1),
         ];
-        let (_p, c) = paginate_mount_entries(e, None, "name", true, 1, None);
+        let (_p, c) = paginate_mount_entries(e, None, FolderOrderBy::Name, true, 1, None);
         let decoded = FolderResourceCursor::decode(&c.unwrap()).unwrap();
         assert!(decoded.reverse);
-        assert_eq!(decoded.order_by, "name");
+        assert_eq!(decoded.order_by, FolderOrderBy::Name);
     }
 }
 
 #[cfg(all(test, integration_tests))]
 mod mount_authz_integration {
     use super::*;
-    use crate::application::dtos::folder_dto::ListResourcesOptions;
+    use crate::application::dtos::folder_dto::{FolderOrderBy, ListResourcesOptions};
     use crate::application::services::external_mount_router::{MountRouter, ResolvedId};
     use crate::application::services::file_retrieval_service::FileRetrievalService;
     use crate::application::services::mount_registry::MountRegistry;
@@ -2044,7 +2107,7 @@ mod mount_authz_integration {
         ListResourcesOptions {
             limit: 50,
             cursor: None,
-            order_by: "name",
+            order_by: FolderOrderBy::Name,
             kinds: None,
             reverse: false,
         }
@@ -2452,6 +2515,124 @@ mod mount_authz_integration {
             .list_mount_dir_with_perms(&cfg, &NodeId::default(), stranger, opts())
             .await
             .expect_err("stranger must be denied");
+        assert_eq!(err.kind, crate::domain::errors::ErrorKind::NotFound);
+    }
+
+    /// #792 regression pin: the keyset (batch) folder listing — the folder
+    /// half of the WebDAV / NextCloud PROPFIND Depth:1 loop — must branch to
+    /// the provider for mount directories exactly like the file half does.
+    /// Before the fix it queried `storage.folders` for children of the mount
+    /// root, found none, and Depth:1 listed files but no subdirectories.
+    /// Covers the mount root, an `ext:` child, the `after_name` cursor and the
+    /// stranger-denied path (NotFound — anti-enumeration).
+    #[tokio::test]
+    async fn batch_folder_listing_descends_into_mount() {
+        let (_c, pool) = fresh_db().await;
+        let host = tempfile::tempdir().unwrap();
+        std::fs::create_dir(host.path().join("beta")).unwrap();
+        std::fs::create_dir(host.path().join("Alpha")).unwrap();
+        std::fs::create_dir(host.path().join("Alpha").join("nested")).unwrap();
+        std::fs::write(host.path().join("file.txt"), b"not a folder").unwrap();
+        let (fs, mount_id, owner) = wire_mount(&pool, host.path()).await;
+
+        // Mount root: directories only, case-insensitive name order.
+        let page = fs
+            .list_folders_batch_with_perms(Some(&mount_id), owner, None, 50)
+            .await
+            .expect("owner may list");
+        let names: Vec<_> = page.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["Alpha", "beta"]);
+        assert!(
+            page.iter()
+                .all(|f| f.parent_id.as_deref() == Some(mount_id.as_str())),
+            "children of the mount root point back at the root UUID"
+        );
+
+        // Keyset cursor resumes after the named entry.
+        let rest = fs
+            .list_folders_batch_with_perms(Some(&mount_id), owner, Some("Alpha"), 50)
+            .await
+            .expect("owner may page");
+        let names: Vec<_> = rest.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["beta"]);
+
+        // An `ext:` child directory lists ITS subdirectories (#794's PROPFIND
+        // on a path below the root relies on this once the handler resolves it).
+        let child_id = encode_child_id(Uuid::parse_str(&mount_id).unwrap(), "Alpha");
+        let nested = fs
+            .list_folders_batch_with_perms(Some(&child_id), owner, None, 50)
+            .await
+            .expect("owner may list child");
+        let names: Vec<_> = nested.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["nested"]);
+
+        // No grant on the mount root → denied, as NotFound.
+        let stranger = make_user(&pool, "stranger").await;
+        let err = fs
+            .list_folders_batch_with_perms(Some(&mount_id), stranger, None, 50)
+            .await
+            .expect_err("stranger must be denied");
+        assert_eq!(err.kind, crate::domain::errors::ErrorKind::NotFound);
+    }
+
+    /// #793 regression pin: the REST prechecks (`require_permission`) and
+    /// `get_folder_with_perms` must accept `ext:` mount ids. Before the fix
+    /// both parsed the id as a UUID and answered NotFound, so the SPA could
+    /// open a mount root but not a single subfolder (or upload into one).
+    #[tokio::test]
+    async fn rest_prechecks_accept_mount_child_ids() {
+        let (_c, pool) = fresh_db().await;
+        let host = tempfile::tempdir().unwrap();
+        std::fs::create_dir(host.path().join("sub")).unwrap();
+        std::fs::write(host.path().join("sub").join("f.txt"), b"x").unwrap();
+        let (fs, mount_id, owner) = wire_mount(&pool, host.path()).await;
+        let mount_uuid = Uuid::parse_str(&mount_id).unwrap();
+        let sub = encode_child_id(mount_uuid, "sub");
+
+        // Precheck passes for the owner, on the root UUID and on the child.
+        for id in [mount_id.as_str(), sub.as_str()] {
+            let granted = fs
+                .require_permission(&[Subject::User(owner)], Permission::Read, id)
+                .await
+                .expect("owner passes the precheck");
+            assert_eq!(granted, Subject::User(owner));
+        }
+
+        // Folder metadata of a mount subdirectory comes from the provider.
+        let dto = fs
+            .get_folder_with_perms(&sub, Subject::User(owner))
+            .await
+            .expect("owner reads mount subfolder");
+        assert_eq!(dto.name, "sub");
+        assert_eq!(dto.id, sub);
+        assert_eq!(dto.parent_id.as_deref(), Some(mount_id.as_str()));
+
+        // A file id is not a folder.
+        let file_as_folder = encode_child_id(mount_uuid, "sub/f.txt");
+        let err = fs
+            .get_folder_with_perms(&file_as_folder, Subject::User(owner))
+            .await
+            .expect_err("file is not a folder");
+        assert_eq!(err.kind, crate::domain::errors::ErrorKind::NotFound);
+
+        // Stranger: denied on both paths, as NotFound.
+        let stranger = make_user(&pool, "stranger").await;
+        let err = fs
+            .require_permission(&[Subject::User(stranger)], Permission::Read, &sub)
+            .await
+            .expect_err("stranger denied");
+        assert_eq!(err.kind, crate::domain::errors::ErrorKind::NotFound);
+        let err = fs
+            .get_folder_with_perms(&sub, Subject::User(stranger))
+            .await
+            .expect_err("stranger denied");
+        assert_eq!(err.kind, crate::domain::errors::ErrorKind::NotFound);
+
+        // Garbage ids still NotFound, never 500.
+        let err = fs
+            .require_permission(&[Subject::User(owner)], Permission::Read, "garbage")
+            .await
+            .expect_err("garbage id");
         assert_eq!(err.kind, crate::domain::errors::ErrorKind::NotFound);
     }
 

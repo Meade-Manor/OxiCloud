@@ -5,8 +5,6 @@
 	import { resolve } from '$app/paths';
 	import { onMount } from 'svelte';
 	import {
-		displayRole,
-		expiryToIso,
 		fetchMyShares,
 		notifyGrantRecipient,
 		revokeGrant,
@@ -16,23 +14,28 @@
 		type OutgoingResourceGrant,
 		type ShareRole
 	} from '$lib/api/endpoints/grants';
+	import { displayRole } from '$lib/utils/grantFormat';
+	import { expiryToIso } from '$lib/utils/dateInput';
 	import { copyShareLink, deleteShare, getShareById, updateShare } from '$lib/api/endpoints/shares';
 	import { ensureResolvers, resolveLabel } from '$lib/api/endpoints/recipients';
 	import { fileInlineUrl } from '$lib/api/endpoints/files';
-	import type { FileItem, FolderItem } from '$lib/api/types';
+	import type { FileItem } from '$lib/api/types';
 	import type { GrantResourceType } from '$lib/api/endpoints/grants';
 	import Icon from '$lib/icons/Icon.svelte';
 	import ListToolbar from '$lib/components/ListToolbar.svelte';
 	import { lazyComponent } from '$lib/composables/lazyComponent.svelte';
 	import UserVignette from '$lib/components/UserVignette.svelte';
+	import type { OutgoingGrantOrderBy } from '$lib/api/generated/openapi/types.gen';
 	import { t } from '$lib/i18n/index.svelte';
 	import { ui } from '$lib/stores/ui.svelte';
-	import { formatDate, iconNameFromClass } from '$lib/utils/display';
+	import { formatDate, iconNameFor } from '$lib/utils/display';
 	import { SharedLanesBuilder, type LaneGrouping } from '$lib/utils/sharedLanes';
 
 	type GroupBy = 'items' | 'sharedWith';
 
-	const GROUP_BYS: { key: GroupBy; label: string; orderBy: string }[] = [
+	// §7 part 3g: `orderBy` is the generated OUTGOING union — `subject` is
+	// valid only on this endpoint, and the type now says so.
+	const GROUP_BYS: { key: GroupBy; label: string; orderBy: OutgoingGrantOrderBy }[] = [
 		{ key: 'items', label: t('groupby.byFiles', 'By files'), orderBy: 'type' },
 		{ key: 'sharedWith', label: t('groupby.sharedWith', 'Shared with'), orderBy: 'subject' }
 	];
@@ -459,9 +462,9 @@
 		// and drive both grant access to a tree, but the scope is very
 		// different.
 		if (item.resource_type === 'drive') return 'hdd';
-		return item.resource_type === 'folder'
-			? 'folder'
-			: iconNameFromClass((item.resource as FileItem | FolderItem).icon_class);
+		if (item.resource_type === 'folder') return 'folder';
+		const file = item.resource as FileItem;
+		return iconNameFor(file.name, file.mime_type);
 	}
 
 	const isEmpty = $derived(!loading && raw.length === 0 && !error);

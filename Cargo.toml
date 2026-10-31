@@ -112,7 +112,7 @@ thiserror = "2.0.18"
 arc-swap = "1.9"
 
 mockall = { version = "0.14.0", optional = true }
-sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio", "tls-rustls", "chrono", "uuid", "json", "migrate"] }
+sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio", "tls-rustls-ring-native-roots", "chrono", "uuid", "json", "migrate"] }
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 argon2 = "0.5.3"
 rand_core = { version = "0.6", features = ["std", "getrandom"] }
@@ -160,11 +160,11 @@ blake3 = { version = "1.8.5", features = ["rayon", "mmap"] }
 hex = "0.4.3"
 http-body-util = "0.1.3"
 percent-encoding = "2.3.2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots","rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 base64 = "0.22.1"
 fs2 = "0.4"
 rayon = "1.12.0"
-infer = "0.19"
+infer = "0.22"
 async-compression = { version = "0.4.42", features = ["tokio", "gzip"] }
 async_zip = { version = "0.0.18", features = ["tokio", "deflate"] }
 dashmap = "6.2.1"
@@ -181,7 +181,16 @@ utoipa = { version = "5.5.0", features = ["axum_extras", "uuid", "chrono"] }
 # aws_sdk_s3::config with static credentials; nothing referenced either
 # crate, and aws-config alone pulled aws-sdk-sso/ssooidc/sts (~90 crates)
 # into every build (benches/ROUND3.md).
-aws-sdk-s3 = "1.136.0"
+# `default-features = false` lets us keep the modern `default-https-client`
+# (hyper 1 + rustls 0.23) and drop the deprecated `rustls` feature which pulls
+# an unused hyper-0.14 + rustls 0.21 chain (RUSTSEC-2026-0346, -0349).
+aws-sdk-s3 = { version = "1.136.0", default-features = false, features = [
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+    "behavior-version-latest",
+] }
 azure_core = { version = "0.21", default-features = false, features = ["enable_reqwest_rustls", "hmac_rust"] }
 azure_storage = { version = "0.21", default-features = false, features = ["enable_reqwest_rustls", "hmac_rust"] }
 azure_storage_blobs = { version = "0.21", default-features = false, features = ["enable_reqwest_rustls", "hmac_rust"] }
@@ -194,10 +203,10 @@ smol_str = { version = "0.3.6", features = ["serde"] }
 accept-language = "3.1.0"
 askama = "0.16.0"
 tantivy = "0.26.1"
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 pdf-extract = "0.12.0"
 nom-exif = "3.6.1"
-extism = { version = "1.30.0", optional = true }
+extism = { version = "1.41", optional = true }
 toml = "1.1.2"
 file-rotate = { version = "0.7.6", optional = true }
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "tracing", "api-24"], optional = true }

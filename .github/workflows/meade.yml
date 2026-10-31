@@ -1,5 +1,5 @@
 # Meade Manor's build of OxiCloud: an upstream release (the `meade` branch
-# starts at its tag) plus the fixes merged into `meade`, published as
+# carries its tag) plus the fixes merged into `meade`, published as
 # ghcr.io/<owner>/oxicloud:<upstream version>-<commit> for Monster to pin by
 # digest. Each fix is also offered upstream; when a release carries all of
 # them, Monster goes back to the upstream image and this branch is retired.
@@ -23,9 +23,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # The upstream release `meade` starts from. Change it together with the
-  # rebase onto a newer release.
-  UPSTREAM_VERSION: "0.9.3"
+  # The upstream release `meade` carries. Change it together with the merge
+  # of a newer release's tag into `meade`.
+  UPSTREAM_VERSION: "0.10.0"
   # The Dockerfile's builder is rust:1.96-alpine3.24.
   RUST_VERSION: "1.96.1"
   HURL_VERSION: "8.0.1"

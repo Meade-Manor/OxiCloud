@@ -9,9 +9,11 @@
 		batchTrash,
 		fetchPhotos,
 		type PhotoItem,
-		type PhotosKind,
-		type PhotosOrderBy
+		type PhotosKind
 	} from '$lib/api/endpoints/photos';
+	// §7 part 3g: the axis comes from the SDK now. `endpoints/photos.ts`
+	// used to re-declare it as `PhotosOrderBy`, identical to this union.
+	import type { PhotoOrderBy } from '$lib/api/generated/openapi/types.gen';
 	import { fetchHashSiblings, type HashSibling } from '$lib/api/endpoints/dedup';
 	import DedupSiblingsDialog from '$lib/components/DedupSiblingsDialog.svelte';
 	import { peopleEnabled } from '$lib/api/endpoints/people';
@@ -119,7 +121,7 @@
 	 * so a change here MUST reset-and-reload (same as kind / drive /
 	 * favourites).
 	 */
-	let orderBy = $state<PhotosOrderBy>('captured_at');
+	let orderBy = $state<PhotoOrderBy>('captured_at');
 	let reverse = $state(false);
 	/** Open/close for the order-by dropdown trigger. */
 	let orderByOpen = $state(false);
@@ -350,7 +352,7 @@
 		void resetAndReload();
 	}
 
-	function setOrderBy(axis: PhotosOrderBy) {
+	function setOrderBy(axis: PhotoOrderBy) {
 		if (orderBy === axis) return;
 		orderBy = axis;
 		if (typeof localStorage !== 'undefined') {
@@ -554,10 +556,16 @@
 			favoriteFilter = true;
 		const savedOrderBy =
 			typeof localStorage !== 'undefined' ? localStorage.getItem(ORDER_BY_KEY) : null;
-		if (
+		// §6 renamed the `updated_at` axis to `modified_at`. This preference
+		// is PERSISTED, so stored values outlive the deploy: anyone who had
+		// picked "Last modified" has `updated_at` in localStorage, which now
+		// matches no axis and would silently fall back to the default —
+		// changing their view for no visible reason. Map it on read.
+		if (savedOrderBy === 'updated_at') orderBy = 'modified_at';
+		else if (
 			savedOrderBy === 'captured_at' ||
 			savedOrderBy === 'created_at' ||
-			savedOrderBy === 'updated_at'
+			savedOrderBy === 'modified_at'
 		)
 			orderBy = savedOrderBy;
 		if (typeof localStorage !== 'undefined' && localStorage.getItem(REVERSE_KEY) === 'true')
@@ -958,10 +966,10 @@
 							<button
 								type="button"
 								class="group-by-option"
-								class:active={orderBy === 'updated_at'}
+								class:active={orderBy === 'modified_at'}
 								data-testid="photos-order-by-updated-at"
 								onclick={() => {
-									setOrderBy('updated_at');
+									setOrderBy('modified_at');
 									orderByOpen = false;
 								}}
 							>

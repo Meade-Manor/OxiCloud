@@ -205,6 +205,7 @@ impl FileUploadService {
         name: String,
         folder_id: String,
         hash: &str,
+        source_modified_at: Option<i64>,
     ) -> Result<FileDto, DomainError> {
         let Some(InstantUploadDeps {
             authz,
@@ -257,11 +258,9 @@ impl FileUploadService {
         // The manifest knows the original content type; fall back to the
         // new name's extension when the stored one is generic.
         let claimed = metadata.content_type.as_deref().unwrap_or("");
-        let content_type =
-            match crate::common::mime_detect::refine_content_type(&[], &name, claimed) {
-                ct if ct.is_empty() => "application/octet-stream".to_string(),
-                ct => ct,
-            };
+        // The empty-string fallback lives in `refine_content_type` now —
+        // see its step 4 for why it belongs there and not here.
+        let content_type = crate::common::mime_detect::refine_content_type(&[], &name, claimed);
 
         // Take the reference the row registration will consume (it releases
         // it again on any failure). A concurrent GC between the ownership
@@ -280,6 +279,12 @@ impl FileUploadService {
                     is_new_blob: false,
                 },
                 caller_id,
+                // §9 — the caller's asserted source mtime, already rounded
+                // and validated by the handler. This endpoint is
+                // `uploadOneFile`'s first short-circuit, so without its own
+                // slot a re-upload of already-owned content lost the mtime
+                // even for a small file.
+                source_modified_at,
             )
             .await?;
 
@@ -299,6 +304,7 @@ impl FileUploadService {
         caller_id: Uuid,
         file_id: &str,
         blob: StoredBlob,
+        source_modified_at: Option<i64>,
     ) -> Result<FileDto, DomainError> {
         let Some(InstantUploadDeps { authz, .. }) = &self.instant_upload else {
             return Err(DomainError::internal_error(
@@ -326,7 +332,17 @@ impl FileUploadService {
         let file = file_read.get_file(file_id).await?;
         let (new_hash, updated_at) = self
             .file_write
-            .update_file_content_with_blob(file_id, &blob.hash, blob.size, None, caller_id, None)
+            .update_file_content_with_blob(
+                file_id,
+                &blob.hash,
+                blob.size,
+                // §9 — the client's asserted source mtime. Delta UPDATE is a
+                // content replacement, so the mtime the client reports for
+                // those bytes is exactly what belongs in the content clock.
+                source_modified_at,
+                caller_id,
+                None,
+            )
             .await?;
         // The file maps to a different blob now — stale cached content must
         // never be served for the rest of its TTI window.
@@ -456,6 +472,7 @@ impl FileUploadUseCase for FileUploadService {
         content_type: String,
         blob: StoredBlob,
         caller_id: Uuid,
+        source_modified_at: Option<i64>,
     ) -> Result<FileDto, DomainError> {
         let file = self
             .file_write
@@ -466,6 +483,11 @@ impl FileUploadUseCase for FileUploadService {
                 &blob.hash,
                 blob.size,
                 caller_id,
+                // §9 — the client's asserted source mtime, already rounded
+                // from milliseconds and validated against the trust bounds
+                // by the caller. `None` stamps NOW(), which is every caller
+                // that has nothing to assert.
+                source_modified_at,
             )
             .await?;
         let dto = FileDto::from(file);
@@ -538,7 +560,7 @@ impl FileUploadUseCase for FileUploadService {
                 .await?;
         }
 
-        self.upload_file_streaming(name, folder_id, content_type, blob, caller_id)
+        self.upload_file_streaming(name, folder_id, content_type, blob, caller_id, None)
             .await
     }
 
@@ -707,6 +729,13 @@ impl FileUploadUseCase for FileUploadService {
                 &blob.hash,
                 blob.size,
                 caller_id,
+                // The CREATE half of this method must honour the client's
+                // asserted mtime exactly as the UPDATE half above does.
+                // Dropping it here meant `X-OC-Mtime` was silently ignored on
+                // a NEW file — the common NextCloud-desktop case, since a
+                // desktop client is usually uploading a file that already
+                // existed locally with a real mtime.
+                modified_at,
             )
             .await?;
         let dto = FileDto::from(created);

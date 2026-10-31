@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 /// Query parameters for `GET /api/photos/resources` — the normalized
 /// envelope endpoint. Deliberately NOT re-using the opaque base64 cursor
-/// via `CursorQuery`'s `sort_by: Option<String>` because photos has a
+/// via `CursorQuery`'s `order_by: Option<String>` because photos has a
 /// typed [`PhotoOrderBy`] enum we want validated at wire-decode time;
 /// `cursor` and `limit` reuse the same convention.
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -254,7 +254,7 @@ pub async fn list_photos_resources(
                 resource: ResourceContentDto::File(dto),
                 width: r.width,
                 height: r.height,
-                sort_date: r.sort_date,
+                sort_date: r.sort_date_ts,
                 captured_at: r.captured_at,
                 orientation: r.orientation,
                 has_gps: r.has_gps,

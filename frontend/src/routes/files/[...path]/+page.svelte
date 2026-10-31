@@ -12,12 +12,11 @@
 		deleteFolder,
 		fetchFolderPage,
 		getFolderAncestors,
-		invalidateFolderCache,
 		moveFolder,
-		rememberFolderName,
 		renameFolder,
 		type FolderListing
 	} from '$lib/api/endpoints/folders';
+	import { invalidateFolderCache, rememberFolderName } from '$lib/utils/folderCache';
 	import {
 		deleteFile,
 		fileDownloadUrl,
@@ -51,13 +50,14 @@
 	import { TEXTY_EXT_RE } from '$lib/utils/textyExt';
 	import { preferences } from '$lib/stores/preferences.svelte';
 	import { serverConfig } from '$lib/stores/serverConfig.svelte';
-	import type { FileItem, FolderItem, ItemType } from '$lib/api/types';
+	import type { DrivePolicies, FileItem, FolderItem, ItemType } from '$lib/api/types';
 	import Banner from '$lib/components/Banner.svelte';
 	import FolderBreadcrumb from '$lib/components/FolderBreadcrumb.svelte';
 	import ResourceList, {
 		isFile,
 		type GroupByDef as RLGroupByDef
 	} from '$lib/components/ResourceList.svelte';
+	import type { FolderOrderBy } from '$lib/api/generated/openapi/types.gen';
 	import { lazyComponent } from '$lib/composables/lazyComponent.svelte';
 	import { useFolderTopic } from '$lib/composables/useFolderTopic.svelte';
 	import log from 'loglevel';
@@ -1800,8 +1800,11 @@
 	// (the previous `$state` + two `$effect` mirror was fragile — a
 	// programmatic write to either side triggered an update on the
 	// other, and eslint's `prefer-writable-derived` rightly flagged it).
-	type SortField = 'name' | 'type' | 'size' | 'modified_at' | 'created_at';
-	let sortField = $state<SortField>('name');
+	// §7 part 3g: was a hand-written union identical to the generated
+	// `FolderOrderBy`. Deleted rather than kept in sync — a local copy of
+	// an SDK type is a silent drift waiting to happen the next time the
+	// server's accepted set changes.
+	let sortField = $state<FolderOrderBy>('name');
 	let reversed = $state(false);
 
 	// Server does the sort (order_by=sortField, reverse=reversed on every
@@ -1863,7 +1866,7 @@
 			if (key === NEW_KEY) return labelForNew;
 			return inner ? inner(key) : key;
 		};
-	const rlGroupBys = $derived<RLGroupByDef[]>([
+	const rlGroupBys = $derived<RLGroupByDef<FolderOrderBy>[]>([
 		{
 			key: '',
 			label: t('files.name', 'Name'),
@@ -1903,7 +1906,7 @@
 		},
 		{
 			key: 'createdAt',
-			label: t('groupby.createdAt', 'Created date'),
+			label: t('groupby.createdAt', 'Added date'),
 			orderBy: 'created_at',
 			icon: 'layer-group',
 			bucketOf: wrapNew((item) => dateBucket(item.created_at)),
@@ -2185,7 +2188,10 @@
 	     pinned. Shows when either any item in the current listing surfaces
 	     a `drive_id` for a frozen drive, or (empty folder fallback) the
 	     URL's leading segment resolves to one. -->
-	{#if currentDrive?.policies?.read_only}
+	<!-- `currentDrive.policies` is typed `{ [key: string]: unknown }` on
+	     the SDK — forward-compat for unknown knobs. Narrow to the typed
+	     view here to read a known policy. -->
+	{#if currentDrive && (currentDrive.policies as DrivePolicies).read_only}
 		<Banner
 			severity="info"
 			icon="lock"
@@ -2260,7 +2266,8 @@
 		hasMore={pageCursor !== undefined}
 		onloadmore={loadMore}
 		onreload={(orderBy) => {
-			sortField = orderBy as SortField;
+			// Typed by `ResourceList<FolderOrderBy>` — no assertion needed.
+			sortField = orderBy;
 		}}
 		onopen={rlOnOpen}
 		onfavorite={rlOnFavorite}

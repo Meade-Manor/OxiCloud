@@ -9,9 +9,7 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::application::dtos::display_helpers::{
-    classify_display, format_file_size, intern_display, intern_mime,
-};
+use crate::application::dtos::display_helpers::{ResourceCategory, category_for, intern_mime};
 use crate::application::dtos::file_dto::FileDto;
 use crate::application::dtos::folder_dto::FolderDto;
 use crate::application::dtos::timestamp_helpers::epoch_to_datetime;
@@ -81,7 +79,7 @@ impl PathResolverService {
                 Option<String>, // parent_id
                 Uuid,           // drive_id
                 i64,            // created_at
-                i64,            // modified_at
+                i64,            // content_modified_at → entity `modified_at`
                 Option<i64>,    // size
                 Option<String>, // mime_type
                 Option<String>, // folder_id
@@ -91,7 +89,7 @@ impl PathResolverService {
         >(
             r#"
             SELECT resource_type, id, name, path, parent_id, drive_id,
-                   created_at, modified_at, size, mime_type, folder_id,
+                   created_at, content_modified_at, size, mime_type, folder_id,
                    blob_hash, tree_modified_at
               FROM (
                 SELECT 'folder'::text       AS resource_type,
@@ -101,7 +99,7 @@ impl PathResolverService {
                        fo.parent_id::text,
                        fo.drive_id,
                        EXTRACT(EPOCH FROM fo.created_at)::bigint AS created_at,
-                       EXTRACT(EPOCH FROM fo.updated_at)::bigint AS modified_at,
+                       EXTRACT(EPOCH FROM fo.content_modified_at)::bigint AS content_modified_at,
                        NULL::bigint         AS size,
                        NULL::text           AS mime_type,
                        NULL::text           AS folder_id,
@@ -124,7 +122,7 @@ impl PathResolverService {
                        NULL::text           AS parent_id,
                        fi.drive_id,
                        EXTRACT(EPOCH FROM fi.created_at)::bigint AS created_at,
-                       EXTRACT(EPOCH FROM fi.updated_at)::bigint AS modified_at,
+                       EXTRACT(EPOCH FROM fi.content_modified_at)::bigint AS content_modified_at,
                        fi.size,
                        fi.mime_type,
                        fi.folder_id::text,
@@ -180,10 +178,8 @@ impl PathResolverService {
                     drive_id,
                     created_at: epoch_to_datetime(created_at.max(0) as u64),
                     modified_at: epoch_to_datetime(modified_at.max(0) as u64),
-                    is_root: false,
-                    icon_class: intern_display("fas fa-folder"),
-                    icon_special_class: intern_display("folder-icon"),
-                    category: intern_display("Folder"),
+                    tree_modified_at: epoch_to_datetime(tree_mod),
+                    category: ResourceCategory::Folder,
                     // §14 provenance not selected by this resolver path —
                     // it's used for existence/type discrimination, not
                     // detailed DTO emission. Callers that need provenance
@@ -206,7 +202,6 @@ impl PathResolverService {
                 let hash = blob_hash.unwrap_or_default();
                 let modified_at_u = modified_at as u64;
                 let etag = File::compute_etag(&hash, modified_at_u);
-                let classes = classify_display(&name, &mime);
                 Ok(ResolvedResource::File(FileDto {
                     id,
                     name: name.clone(),
@@ -216,10 +211,7 @@ impl PathResolverService {
                     folder_id,
                     created_at: epoch_to_datetime(created_at.max(0) as u64),
                     modified_at: epoch_to_datetime(modified_at_u),
-                    icon_class: intern_display(classes.icon_class),
-                    icon_special_class: intern_display(classes.icon_special_class),
-                    category: intern_display(classes.category),
-                    size_formatted: format_file_size(sz),
+                    category: category_for(&name, &mime),
                     content_hash: hash,
                     etag,
                     // §14 provenance not selected by this resolver path

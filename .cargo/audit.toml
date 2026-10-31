@@ -222,6 +222,52 @@ ignore = [
     # Un-ignore trigger: same as RUSTSEC-2026-0327 above.
     "RUSTSEC-2026-0316",
 
+    # wasmtime 43.0.2 — three advisories published 2026-10-14, same crate,
+    # same `extism 1.30.0` chain, same absent upgrade path as the two
+    # wasmtime entries above: extism pins `wasmtime ^43` and the fixed
+    # releases for all three are >=48.0.6 <49 or >=49.0.3 — out of range.
+    #
+    # All three target the WebAssembly **Component Model**, which extism's
+    # PDK does not use (plugins/runtime.rs loads core `wasmtime::Module` /
+    # `Instance`, never `wasmtime::component::*`). Same unreachability
+    # argument as RUSTSEC-2026-0327; the standard `--features plugins`
+    # build-gate + `OXICLOUD_ENABLE_PLUGINS=true` runtime gate still apply
+    # on top.
+    #
+    #   RUSTSEC-2026-0362: async-entrypoint not enforced on component
+    #                      lifted exports (Component Model only).
+    #   RUSTSEC-2026-0363: handle tables capped only per-instance,
+    #                      charged to no resource limit (Component
+    #                      Model resource handles).
+    #   RUSTSEC-2026-0359: stack overflow dropping a long chain of
+    #                      recursive types (Component Model type
+    #                      elaboration).
+    #
+    # Un-ignore trigger: same as RUSTSEC-2026-0327 above — extism moves
+    # to wasmtime >=48.0.6 / >=49.0.3, OR OxiCloud starts using
+    # `wasmtime::component::*` directly.
+    "RUSTSEC-2026-0362",
+    "RUSTSEC-2026-0363",
+    "RUSTSEC-2026-0359",
+
+    # rustls-pemfile 2.2.0 — "rustls-pemfile is unmaintained"
+    # (RUSTSEC-2025-0134). Transitive via
+    # `testcontainers 0.25.2 → bollard 0.19.4 → rustls-pemfile 2.2.0`
+    # on the DEV-dependency tree only (testcontainers is pulled by
+    # `--cfg integration_tests`). Never compiled into the production
+    # binary. The crate is deprecated in favour of `rustls-pki-types`
+    # which bollard has not yet adopted.
+    #
+    # Severity: informational (unmaintained, no CVE). Even if a
+    # security issue surfaced later, exposure is bounded to the
+    # integration-test harness talking to the local test Postgres
+    # container over a trusted socket — no attacker-controlled TLS
+    # material reaches the parser.
+    #
+    # Un-ignore trigger: bollard drops `rustls-pemfile` for
+    # `rustls-pki-types`, OR testcontainers 0.26+ cuts the bollard dep.
+    "RUSTSEC-2025-0134",
+
     # astral-tokio-tar 0.5.6 — tar extraction advisories, transitive via
     # testcontainers → testcontainers-modules, a DEV-dependency used only by
     # the `--cfg integration_tests` harness to spin up throwaway Postgres
@@ -237,4 +283,44 @@ ignore = [
     "RUSTSEC-2026-0112",
     "RUSTSEC-2026-0113",
     "RUSTSEC-2026-0066",
+
+    # crypto-bigint 0.5.5 — "Multiple timing variability issues in operations
+    # intended to be constant-time" (RUSTSEC-2026-0387, fixed in >=0.7.6).
+    #
+    # NO UPGRADE PATH, and the blocker is one crate:
+    #
+    #   crypto-bigint 0.5.5
+    #     <- elliptic-curve 0.13.8  (requires crypto-bigint ^0.5)
+    #          <- opaque-ke 3.0.0   (requires elliptic-curve ^0.13)  [direct dep]
+    #          <- p256 0.13 / p384 0.13 <- jsonwebtoken 10.4.0
+    #     <- aws-sigv4 1.6.0 <- aws-sdk-s3
+    #
+    # `cargo update -p crypto-bigint --precise 0.7.6` fails on
+    # elliptic-curve's `^0.5` requirement. The rest of the stack HAS moved
+    # (elliptic-curve 0.14.2, p256 0.14.0, jsonwebtoken 11.1.0,
+    # aws-sigv4 1.6.3), but bumping those does not help: cargo would resolve
+    # crypto-bigint 0.7.x ALONGSIDE 0.5.5, which stays in the tree for
+    # opaque-ke, so the advisory still fires. opaque-ke's only release newer
+    # than 3.0.0 is 4.1.0-pre.2 — a pre-release, and this is the
+    # password-authentication path, so adopting unaudited pre-release crypto
+    # to retire a timing-variability advisory is the worse side of the trade.
+    #
+    # EXPOSURE, by whether the path has a secret operand:
+    #   * opaque-ke / OPAQUE PAKE — the one that matters. Secret scalars
+    #     derived from password material.
+    #   * aws-sigv4 `sigv4a` — private-key ECDSA. The feature is enabled in
+    #     Cargo.toml, but only exercised if an S3 backend actually signs with
+    #     sigv4a (multi-region access points).
+    #   * jsonwebtoken ES256/ES384 — negligible. `oidc_service.rs` maps JWKS
+    #     key algorithms, i.e. VERIFICATION against the IdP's public keys;
+    #     no secret operand. Our own tokens are HS256.
+    #
+    # Exploiting timing variability needs low-noise measurement of those
+    # operations — realistically a co-located attacker on a self-hosted box,
+    # not a remote one.
+    #
+    # UNBLOCK CONDITION: opaque-ke 4.x stable -> elliptic-curve 0.14 ->
+    # crypto-bigint >=0.7.6. Tracked in AtalayaLabs/OxiCloud#834; re-check
+    # whenever `cargo search opaque-ke` shows a non-pre-release 4.x.
+    "RUSTSEC-2026-0387",
 ]

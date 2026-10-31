@@ -70,6 +70,7 @@ use crate::infrastructure::repositories::pg::{
 use crate::infrastructure::services::audio_metadata_service::AudioMetadataService;
 use crate::infrastructure::services::blob_handler::BlobHandler;
 use crate::infrastructure::services::chunked_upload_service::ChunkedUploadService;
+use crate::infrastructure::services::container_probe_service::ContainerProbe;
 use crate::infrastructure::services::ffmpeg_video_frame_service::{
     FfmpegVideoFrameService, NoopVideoFrameService,
 };
@@ -1712,6 +1713,62 @@ impl AppServiceFactory {
         .register_recoverable_job(&core.job_registry, &job_store_provider_dyn)
         .await;
 
+        // Re-identify stored content from its magic bytes and correct the
+        // type (plus the category it sorts and filters under), then
+        // re-extract metadata for whatever moved.
+        //
+        // **Interval `None` — on demand only.** A run can read the head of
+        // every distinct content in the corpus, which on a metered backend
+        // is a bill. Its name deliberately avoids the `_consistency`
+        // suffix for the same reason: `consistency_batch_service`
+        // auto-enrols anything ending that way into the weekly sweep.
+        //
+        // Takes both metadata services and calls their public methods —
+        // the job carries no extraction logic of its own. Audio is
+        // `Option` because the feature can be off; the job then simply
+        // skips the audio arm.
+        //
+        // The container probe is Option for the same reason video
+        // thumbnails are: ffprobe may not be installed. Absent, the four
+        // ambiguous container types keep their default reading and a
+        // later run corrects them — nothing fails and nothing is
+        // guessed.
+        let container_probe = {
+            let ffprobe_path =
+                ContainerProbe::path_from_ffmpeg(&self.config.video_thumbnails.ffmpeg_path);
+            if ContainerProbe::is_available(&ffprobe_path) {
+                tracing::info!(
+                    "🎚️  content_rescan can resolve audio-vs-video containers (ffprobe '{}')",
+                    ffprobe_path
+                );
+                Some(Arc::new(ContainerProbe::new(
+                    ffprobe_path,
+                    2,
+                    std::time::Duration::from_secs(self.config.video_thumbnails.timeout_secs),
+                )))
+            } else {
+                tracing::info!(
+                    "🎚️  ffprobe not found at '{}' — content_rescan will leave audio-only \
+                     MP4/WebM/Matroska and Theora-in-Ogg at their container default",
+                    ffprobe_path
+                );
+                None
+            }
+        };
+
+        let _ = Arc::new(
+            crate::infrastructure::services::content_rescan_service::ContentRescan::new(
+                maintenance_pool.clone(),
+                core.blob_handler.clone(),
+                core.audio_metadata_service.clone(),
+                core.media_metadata_service.clone(),
+                container_probe,
+                self.config.temp_dir.clone(),
+            ),
+        )
+        .register_recoverable_job(&core.job_registry, &job_store_provider_dyn)
+        .await;
+
         // Its file-keyed twin: `ext-{file_id}.jpg` previews the user uploaded,
         // which no copy path duplicates today. Separate job, separate keying —
         // routing these into the content-keyed table would share one user's
@@ -3136,7 +3193,7 @@ impl AppServiceFactory {
                 let base_url = self.config.base_url();
 
                 let device_auth_svc = Arc::new(DeviceAuthService::new(
-                    device_code_repo,
+                    device_code_repo.clone(),
                     auth_svc.token_service.clone(),
                     user_repo,
                     session_repo,
@@ -3144,6 +3201,22 @@ impl AppServiceFactory {
                 ));
                 app_state.device_auth_service = Some(device_auth_svc);
                 tracing::info!("Device Authorization Grant (RFC 8628) service initialized");
+
+                // Expired device-code cleanup — periodic janitor so the
+                // `auth.device_codes` table doesn't accumulate pending
+                // rows from abandoned `/authorize` ceremonies. Read paths
+                // already filter by `expires_at > NOW()` so this is a
+                // bloat guard, not a correctness fix; registering as a
+                // JobHandler (not a detached task) gives the operator a
+                // run history and an admin trigger. See
+                // `uploads_cleanup_service` for the same shape.
+                let _ = Arc::new(
+                    crate::infrastructure::services::device_codes_cleanup_service::DeviceCodesCleanup::new(
+                        device_code_repo,
+                    ),
+                )
+                .register(&app_state.core.job_registry)
+                .await;
             }
 
             // 9d. Wire App Password service (reuse shared instance)
@@ -3721,7 +3794,7 @@ pub struct CoreServices {
     /// spins up the supervisor loop at the end of `build_app_state`.
     pub job_registry: Arc<JobRegistry>,
     /// PG-backed provider for `jobs.recoverable_runs`. Recoverable
-    /// tenants (storage migration, reextract, consistency checks —
+    /// tenants (storage migration, content_rescan, consistency checks —
     /// Part 2 of `docs/plan/job-registry.md`) plug into this via
     /// `svc.register_recoverable_job(&registry, &job_store_provider).await`.
     /// Boot-time crash-recovery sweep is run in `build_app_state` right
