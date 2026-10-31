@@ -15,36 +15,39 @@ use utoipa::{Modify, OpenApi};
 use crate::application::dtos::contact_dto::{
     AddressDto, ContactDto, ContactGroupDto, EmailDto, PhoneDto,
 };
+use crate::application::dtos::display_helpers::ResourceCategory;
 use crate::application::dtos::drive_dto::{DriveDto, DriveKindDto};
 use crate::application::dtos::favorites_dto::{
-    BatchFavoritesResult, BatchFavoritesStats, FavoriteItemDto, FavoritesResourceItemDto,
+    BatchFavoritesResult, BatchFavoritesStats, FavoriteItemDto, FavoritesOrderBy,
+    FavoritesResourceItemDto,
 };
 use crate::application::dtos::file_dto::FileDto;
 use crate::application::dtos::folder_dto::{
     AccessSourceDriveDto, AccessSourceDto, AccessSourceKind, AccessSourceSubjectDto,
     AccessSourceSubjectKind, CreateFolderDto, FolderAncestorDto, FolderAncestorsDto, FolderDto,
-    FolderResourceItemDto, MoveFolderDto, RenameFolderDto,
+    FolderOrderBy, FolderResourceItemDto, MoveFolderDto, RenameFolderDto,
 };
 use crate::application::dtos::folder_listing_dto::FolderListingDto;
 use crate::application::dtos::grant_dto::{
-    CreateGrantDto, GrantDto, OutgoingResourceItemDto, PermissionDto, ResourceContentDto,
-    ResourceDto, ResourceTypeDto, RoleDto, SharedWithMeDto, SharedWithMeItemDto, SubjectDto,
-    SubjectTypeDto, UpdateRoleDto,
+    CreateGrantDto, GrantDto, IncomingGrantOrderBy, OutgoingGrantOrderBy, OutgoingResourceItemDto,
+    PermissionDto, ResourceContentDto, ResourceDto, ResourceTypeDto, RoleDto, SharedWithMeDto,
+    SharedWithMeItemDto, SubjectDto, SubjectTypeDto, UpdateGrantRoleDto,
 };
 use crate::application::dtos::i18n_dto::{
     LocaleDto, TranslationErrorDto, TranslationRequestDto, TranslationResponseDto,
 };
 use crate::application::dtos::pagination::{PaginationDto, PaginationRequestDto};
-use crate::application::dtos::photos_dto::{PhotoKind, PhotoOrderBy};
-use crate::application::dtos::recent_dto::{RecentItemDto, RecentResourceItemDto};
+use crate::application::dtos::photos_dto::{PhotoKind, PhotoOrderBy, PhotoResourceItemDto};
+use crate::application::dtos::recent_dto::{RecentItemDto, RecentOrderBy, RecentResourceItemDto};
 use crate::application::dtos::search_dto::{
-    SearchCriteriaDto, SearchFileResultDto, SearchFolderResultDto, SearchMeta, SearchResourceItem,
-    SearchResourcesDto, SearchResultsDto, SearchSuggestionItem, SearchSuggestionsDto,
+    SearchCriteriaDto, SearchFileResultDto, SearchFolderResultDto, SearchMeta, SearchOrderBy,
+    SearchResourceItem, SearchResourcesDto, SearchResultsDto, SearchSuggestionItem,
+    SearchSuggestionsDto, SearchTypeFilter,
 };
 use crate::application::dtos::share_dto::{CreateShareDto, ShareDto, UpdateShareDto};
 use crate::application::dtos::trash_dto::{
-    DeletePermanentlyRequest, MoveToTrashRequest, RestoreFromTrashRequest, TrashResourceItemDto,
-    TrashResourcesDto, TrashedItemDto,
+    DeletePermanentlyRequest, MoveToTrashRequest, RestoreFromTrashRequest, TrashOrderBy,
+    TrashResourceItemDto, TrashResourcesDto, TrashedItemDto,
 };
 use crate::application::dtos::user_dto::{
     AuthResponseDto, ChangePasswordDto, LoginDto, OidcExchangeDto, OidcProviderInfoDto,
@@ -53,17 +56,17 @@ use crate::application::dtos::user_dto::{
 use crate::application::ports::chunked_upload_ports::{
     ChunkUploadResponseDto, CreateUploadResponseDto, UploadStatusResponseDto,
 };
-use crate::interfaces::api::handlers::auth_handler::SystemStatus;
+use crate::interfaces::api::handlers::auth_handler::SystemInitStatusDto;
 use crate::interfaces::api::handlers::chunked_upload_handler::{
     CompleteUploadResponse, CreateUploadRequest,
 };
 use crate::interfaces::api::handlers::config_handler::{FeaturesDto, ServerConfigDto};
 use crate::interfaces::api::handlers::contacts_handler::{
-    AddMemberRequest, AddressBookResponse, CreateAddressBookRequest, CreateContactRequest,
-    GroupNameRequest, UpdateAddressBookRequest, UpdateContactRequest,
+    AddContactToGroupRequest, AddressBookResponse, ContactGroupNameRequest,
+    CreateAddressBookRequest, CreateContactRequest, UpdateAddressBookRequest, UpdateContactRequest,
 };
 use crate::interfaces::api::handlers::dedup_handler::{
-    HashCheckAdminResponse, HashCheckResponse, HashSiblingDto, StatsResponse,
+    DedupStatsResponse, HashCheckAdminResponse, HashCheckResponse, HashSiblingDto,
 };
 use crate::interfaces::api::handlers::file_handler::MoveFilePayload;
 use crate::interfaces::middleware::server_status::{HeaderPayload, ProgressHeader};
@@ -96,6 +99,7 @@ use crate::interfaces::middleware::server_status::{HeaderPayload, ProgressHeader
         handlers::auth_handler::dpop_bind,
         handlers::auth_handler::send_magic_link,
         handlers::auth_handler::update_profile,
+        handlers::auth_handler::update_user_image,
         handlers::auth_handler::upgrade_to_internal,
         // File handlers (free functions — see file_handler.rs for why)
         handlers::file_handler::list_files_query,
@@ -356,11 +360,26 @@ use crate::interfaces::middleware::server_status::{HeaderPayload, ProgressHeader
         handlers::subject_group_handler::list_effective_members,
         // Public server-config discovery.
         handlers::config_handler::get_config,
+        // Device-authorization grant (RFC 8628) — client flow + user
+        // verification + device-management endpoints.
+        handlers::device_auth_handler::device_authorize,
+        handlers::device_auth_handler::device_token,
+        handlers::device_auth_handler::device_verify_info,
+        handlers::device_auth_handler::device_verify_action,
+        handlers::device_auth_handler::list_devices,
+        handlers::device_auth_handler::revoke_device,
+        // App passwords — persistent credentials for DAV / NC-Basic clients
+        // (DAVx5, Thunderbird, rclone, NC desktop). Self-service CRUD; the
+        // plaintext secret is returned ONCE at creation and never again.
+        handlers::app_password_handler::create_app_password,
+        handlers::app_password_handler::list_app_passwords,
+        handlers::app_password_handler::revoke_app_password,
     ),
     components(
         schemas(
             // Folder schemas
             FolderDto,
+            FolderOrderBy,
             CreateFolderDto,
             RenameFolderDto,
             MoveFolderDto,
@@ -378,7 +397,7 @@ use crate::interfaces::middleware::server_status::{HeaderPayload, ProgressHeader
             // File schemas
             FileDto,
             // Delta-upload schemas
-            crate::application::services::delta_upload_service::ChunkRef,
+            crate::application::services::delta_upload_service::DeltaChunkRef,
             crate::application::services::delta_upload_service::DeltaNegotiateRequest,
             crate::application::services::delta_upload_service::DeltaNegotiateResponse,
             crate::application::services::delta_upload_service::DeltaChunksResponse,
@@ -398,7 +417,24 @@ use crate::interfaces::middleware::server_status::{HeaderPayload, ProgressHeader
             AuthResponseDto,
             ChangePasswordDto,
             RefreshTokenDto,
-            SystemStatus,
+            SystemInitStatusDto,
+            // Device-authorization grant (RFC 8628).
+            crate::application::dtos::device_auth_dto::DeviceAuthorizeRequestDto,
+            crate::application::dtos::device_auth_dto::DeviceAuthorizeResponseDto,
+            crate::application::dtos::device_auth_dto::DeviceTokenRequestDto,
+            crate::application::dtos::device_auth_dto::DeviceTokenSuccessDto,
+            crate::application::dtos::device_auth_dto::DeviceTokenPendingDto,
+            crate::application::dtos::device_auth_dto::DeviceVerifyRequestDto,
+            crate::application::dtos::device_auth_dto::DeviceVerifyInfoDto,
+            crate::application::dtos::device_auth_dto::DeviceVerifyActionResponseDto,
+            crate::application::services::device_auth_service::DeviceInfoDto,
+            // App-password management.
+            crate::application::dtos::app_password_dto::CreateAppPasswordRequestDto,
+            crate::application::dtos::app_password_dto::AppPasswordCreatedResponseDto,
+            crate::application::dtos::app_password_dto::AppPasswordInstructions,
+            crate::application::dtos::app_password_dto::AppPasswordSummaryDto,
+            crate::application::dtos::app_password_dto::AppPasswordListResponseDto,
+            crate::application::dtos::app_password_dto::AppPasswordRevokeResponseDto,
             // Public server-config discovery — `GET /api/config`.
             ServerConfigDto,
             FeaturesDto,
@@ -409,7 +445,7 @@ use crate::interfaces::middleware::server_status::{HeaderPayload, ProgressHeader
             // so FE consumers can type-narrow on `kind`. Adding a
             // new kind = one more entry here + one Rust struct.
             handlers::notifications_handler::NotificationDto,
-            handlers::notifications_handler::ListResponseDto,
+            handlers::notifications_handler::NotificationListResponseDto,
             handlers::notifications_handler::UnreadCountDto,
             handlers::notifications_handler::MarkAllReadResponseDto,
             crate::domain::entities::notification::SharegrantedPayload,
@@ -442,14 +478,15 @@ use crate::interfaces::middleware::server_status::{HeaderPayload, ProgressHeader
             // is documented in `face_indexing_service` + `onnx_face_analyzer`.
             crate::application::dtos::people_dto::PersonDto,
             crate::application::dtos::people_dto::FaceBoxDto,
-            handlers::people_handler::RenameBody,
-            handlers::people_handler::MergeBody,
+            handlers::people_handler::RenamePersonRequest,
+            handlers::people_handler::MergePeopleRequest,
             // Share schemas
             ShareDto,
             CreateShareDto,
             UpdateShareDto,
             // Trash schemas
             TrashedItemDto,
+            TrashOrderBy,
             TrashResourceItemDto,
             TrashResourcesDto,
             MoveToTrashRequest,
@@ -465,6 +502,9 @@ use crate::interfaces::middleware::server_status::{HeaderPayload, ProgressHeader
             SearchResourceItem,
             SearchMeta,
             SearchCriteriaDto,
+            SearchOrderBy,
+            SearchTypeFilter,
+            ResourceCategory,
             SearchResultsDto,
             SearchFileResultDto,
             SearchFolderResultDto,
@@ -472,11 +512,13 @@ use crate::interfaces::middleware::server_status::{HeaderPayload, ProgressHeader
             SearchSuggestionItem,
             // Favorites schemas
             FavoriteItemDto,
+            FavoritesOrderBy,
             FavoritesResourceItemDto,
             BatchFavoritesResult,
             BatchFavoritesStats,
             // Recent schemas
             RecentItemDto,
+            RecentOrderBy,
             RecentResourceItemDto,
             // i18n schemas
             LocaleDto,
@@ -493,7 +535,7 @@ use crate::interfaces::middleware::server_status::{HeaderPayload, ProgressHeader
             HashCheckResponse,
             HashCheckAdminResponse,
             HashSiblingDto,
-            StatsResponse,
+            DedupStatsResponse,
             // Photos — the two filter enums `PhotosResourcesQueryParams`
             // references via `Option<_>`. utoipa emits them as
             // `$ref`-s on the params; without registering them here
@@ -502,6 +544,18 @@ use crate::interfaces::middleware::server_status::{HeaderPayload, ProgressHeader
             // missing their TS types.
             PhotoKind,
             PhotoOrderBy,
+            // The response item itself. `PhotosResourcesDto` is a generic
+            // alias (`CursorListResponse<PhotoResourceItemDto>`) and aliases
+            // are not registered here — the item type is, exactly as
+            // `FolderResourceItemDto` is for its own listing.
+            //
+            // Omitting it had a real cost: `/api/photos/resources` declares
+            // `body = PhotosResourcesDto`, so the path appeared in the spec
+            // while its item schema did not, the generated SDK carried no TS
+            // type for it, and the frontend kept a HAND-WRITTEN `PhotoItem`
+            // with no drift guard. That is how `captured_at` stayed typed
+            // `number` long after the server began sending RFC 3339.
+            PhotoResourceItemDto,
             // Contacts / address-book schemas
             AddressBookResponse,
             CreateAddressBookRequest,
@@ -513,8 +567,8 @@ use crate::interfaces::middleware::server_status::{HeaderPayload, ProgressHeader
             AddressDto,
             CreateContactRequest,
             UpdateContactRequest,
-            GroupNameRequest,
-            AddMemberRequest,
+            ContactGroupNameRequest,
+            AddContactToGroupRequest,
             // Grant / ReBAC schemas
             SubjectTypeDto,
             SubjectDto,
@@ -523,8 +577,10 @@ use crate::interfaces::middleware::server_status::{HeaderPayload, ProgressHeader
             PermissionDto,
             RoleDto,
             CreateGrantDto,
-            UpdateRoleDto,
+            UpdateGrantRoleDto,
             GrantDto,
+            IncomingGrantOrderBy,
+            OutgoingGrantOrderBy,
             SharedWithMeDto,
             SharedWithMeItemDto,
             OutgoingResourceItemDto,

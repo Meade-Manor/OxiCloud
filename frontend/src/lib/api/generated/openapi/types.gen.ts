@@ -65,6 +65,13 @@ export type AcquireExternalLockDto = {
 };
 
 /**
+ * Request body for adding a contact to a group.
+ */
+export type AddContactToGroupRequest = {
+    contact_id: string;
+};
+
+/**
  * Body for `POST /api/drives/{id}/members`.
  */
 export type AddDriveMemberDto = {
@@ -75,13 +82,6 @@ export type AddDriveMemberDto = {
     expires_at?: string | null;
     role: RoleDto;
     subject: SubjectDto;
-};
-
-/**
- * Request body for adding a contact to a group.
- */
-export type AddMemberRequest = {
-    contact_id: string;
 };
 
 export type AddSubjectGroupMemberRequest = {
@@ -165,10 +165,7 @@ export type AdminCreateUserDto = {
      * Ignored when `is_external = true` (external users have no storage).
      */
     quota_bytes?: number | null;
-    /**
-     * "admin" or "user"; defaults to "user"
-     */
-    role?: string | null;
+    role?: null | UserRoleDto;
     username: string;
 };
 
@@ -196,6 +193,85 @@ export type AdminUsersPageResponse = {
     offset: number;
     total: number;
     users: Array<FullUserDto>;
+};
+
+/**
+ * Response when an app password is created — includes the plain-text password
+ * that is shown ONCE to the user.
+ */
+export type AppPasswordCreatedResponseDto = {
+    /**
+     * Expiration date or null for never.
+     */
+    expires_at?: string | null;
+    /**
+     * Unique identifier for this app password.
+     */
+    id: string;
+    /**
+     * Usage instructions for common clients.
+     */
+    instructions: AppPasswordInstructions;
+    /**
+     * The label chosen by the user.
+     */
+    label: string;
+    /**
+     * The plain-text app password — shown only ONCE.
+     * Format: `oxicloud-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX`
+     */
+    password: string;
+    /**
+     * Active scopes.
+     */
+    scopes: string;
+    /**
+     * The username to use with HTTP Basic Auth.
+     */
+    username: string;
+};
+
+/**
+ * Usage instructions included in the creation response.
+ */
+export type AppPasswordInstructions = {
+    curl_example: string;
+    davx5: string;
+    rclone: string;
+    thunderbird: string;
+};
+
+/**
+ * Response for list endpoint.
+ */
+export type AppPasswordListResponseDto = {
+    app_passwords: Array<AppPasswordSummaryDto>;
+    total: number;
+};
+
+/**
+ * Response for revoke endpoint.
+ */
+export type AppPasswordRevokeResponseDto = {
+    id: string;
+    status: string;
+};
+
+/**
+ * Summary of an app password (list view — never includes the plain-text password).
+ */
+export type AppPasswordSummaryDto = {
+    active: boolean;
+    created_at: string;
+    expires_at?: string | null;
+    id: string;
+    label: string;
+    last_used_at?: string | null;
+    /**
+     * First 8 chars of the token for identification.
+     */
+    prefix: string;
+    scopes: string;
 };
 
 export type AudioMetadataDto = {
@@ -466,21 +542,6 @@ export type ChangePasswordDto = {
 };
 
 /**
- * One chunk reference: `h` = BLAKE3 hex (64 chars), `s` = size in bytes.
- * Field names are deliberately terse — a 10 GB file is ~40 000 of these.
- */
-export type ChunkRef = {
-    /**
-     * BLAKE3 hash of the chunk (64 hex chars).
-     */
-    h: string;
-    /**
-     * Chunk size in bytes (1 ..= 1 MiB).
-     */
-    s: number;
-};
-
-/**
  * Response returned after a single chunk is uploaded.
  */
 export type ChunkUploadResponseDto = {
@@ -569,6 +630,13 @@ export type ContactGroupDto = {
 };
 
 /**
+ * Request body for creating or renaming a group.
+ */
+export type ContactGroupNameRequest = {
+    name: string;
+};
+
+/**
  * Moka content-cache occupancy snapshot (see [`DashboardStatsDto::content_cache`]).
  *
  * Each moka entry holds the ASSEMBLED bytes of one small file
@@ -596,6 +664,24 @@ export type CreateAddressBookRequest = {
     color?: string | null;
     description?: string | null;
     name: string;
+};
+
+/**
+ * POST /api/auth/app-passwords — create a new app password
+ */
+export type CreateAppPasswordRequestDto = {
+    /**
+     * Optional expiration in days (None = never expires)
+     */
+    expires_in_days?: number | null;
+    /**
+     * Human-readable label (e.g. "DAVx5 on Pixel 8")
+     */
+    label: string;
+    /**
+     * Comma-separated scopes (defaults to all DAV protocols)
+     */
+    scopes?: string;
 };
 
 /**
@@ -633,6 +719,20 @@ export type CreateFileByHashRequest = {
      * File name to create (path components are stripped).
      */
     name: string;
+    /**
+     * §9 — the browser's `File.lastModified`, epoch **milliseconds**.
+     *
+     * Optional, and absent means "stamp `NOW()`". Same unit and same
+     * trust bounds as the multipart `source_modified_at` field on
+     * `/api/files/upload`; the server rounds half-up and rejects
+     * implausible values with a 400 rather than clamping.
+     *
+     * This endpoint needs its own slot because it is `uploadOneFile`'s
+     * FIRST short-circuit: re-uploading content the caller already owns
+     * never reaches the multipart path, so without this a duplicate
+     * upload silently lost its source mtime even for a small file.
+     */
+    source_modified_at?: number | null;
 };
 
 /**
@@ -847,10 +947,59 @@ export type DashboardStatsDto = {
 };
 
 /**
+ * Response for dedup stats endpoint
+ */
+export type DedupStatsResponse = {
+    /**
+     * Total bytes saved by deduplication
+     */
+    bytes_saved: number;
+    /**
+     * Deduplication ratio (logical / physical)
+     */
+    dedup_ratio: number;
+    /**
+     * Percentage of storage saved
+     */
+    savings_percentage: number;
+    /**
+     * Total logical bytes (what users think they have)
+     */
+    total_logical_bytes: number;
+    /**
+     * Total physical bytes (actual disk usage)
+     */
+    total_physical_bytes: number;
+    /**
+     * Total number of references (files pointing to blobs)
+     */
+    total_references: number;
+    /**
+     * Total number of unique blobs stored
+     */
+    unique_blobs: number;
+};
+
+/**
  * Request to permanently delete an item from trash
  */
 export type DeletePermanentlyRequest = {
     trash_id: string;
+};
+
+/**
+ * One chunk reference: `h` = BLAKE3 hex (64 chars), `s` = size in bytes.
+ * Field names are deliberately terse — a 10 GB file is ~40 000 of these.
+ */
+export type DeltaChunkRef = {
+    /**
+     * BLAKE3 hash of the chunk (64 hex chars).
+     */
+    h: string;
+    /**
+     * Chunk size in bytes (1 ..= 1 MiB).
+     */
+    s: number;
 };
 
 /**
@@ -859,7 +1008,7 @@ export type DeletePermanentlyRequest = {
  * own hashes to detect corruption before committing.
  */
 export type DeltaChunksResponse = {
-    received: Array<ChunkRef>;
+    received: Array<DeltaChunkRef>;
 };
 
 /**
@@ -872,7 +1021,7 @@ export type DeltaCommitRequest = {
     /**
      * Full chunk sequence, in file order (per occurrence).
      */
-    chunks: Array<ChunkRef>;
+    chunks: Array<DeltaChunkRef>;
     /**
      * BLAKE3 of the complete file (verified server-side, never trusted).
      */
@@ -889,6 +1038,20 @@ export type DeltaCommitRequest = {
      * Create mode: file name (basename).
      */
     name?: string | null;
+    /**
+     * §9 — the browser's `File.lastModified`, epoch **milliseconds**.
+     *
+     * Optional; absent means "stamp `NOW()`". Same unit and trust bounds
+     * as the multipart `source_modified_at` and the by-hash field: the
+     * server rounds half-up and refuses implausible values with a 400.
+     *
+     * This path needs its own slot because the SPA chooses delta purely
+     * by size — everything at or above `DELTA_UPLOAD_MIN_SIZE` (8 MiB)
+     * comes here and never reaches the multipart handler. Without it the
+     * capability was size-dependent: small uploads kept their mtime and
+     * large ones silently lost it.
+     */
+    source_modified_at?: number | null;
 };
 
 /**
@@ -909,7 +1072,7 @@ export type DeltaManifestResponse = {
     /**
      * Full chunk sequence, in file order (per occurrence).
      */
-    chunks: Array<ChunkRef>;
+    chunks: Array<DeltaChunkRef>;
     /**
      * BLAKE3 of the whole file (verify the local reassembly against it).
      */
@@ -927,7 +1090,7 @@ export type DeltaNegotiateRequest = {
     /**
      * The file's chunks, in order (duplicates allowed — repeated content).
      */
-    chunks: Array<ChunkRef>;
+    chunks: Array<DeltaChunkRef>;
 };
 
 /**
@@ -956,6 +1119,142 @@ export type DeltaNotAvailableResponse = {
  */
 export type DeltaStillMissingResponse = {
     still_missing: Array<string>;
+};
+
+/**
+ * POST /api/auth/device/authorize — request body
+ */
+export type DeviceAuthorizeRequestDto = {
+    /**
+     * Human-readable name of the client (e.g. "rclone", "DAVx⁵")
+     */
+    client_name?: string;
+    /**
+     * Comma-separated scopes (e.g. "webdav,caldav,carddav")
+     */
+    scope?: string;
+};
+
+/**
+ * Response to POST /api/auth/device/authorize (RFC 8628 §3.2)
+ */
+export type DeviceAuthorizeResponseDto = {
+    /**
+     * The device verification code
+     */
+    device_code: string;
+    /**
+     * Lifetime in seconds of the device_code and user_code
+     */
+    expires_in: number;
+    /**
+     * Minimum polling interval in seconds
+     */
+    interval: number;
+    /**
+     * The end-user verification code (short, human-readable)
+     */
+    user_code: string;
+    /**
+     * The end-user verification URI
+     */
+    verification_uri: string;
+    /**
+     * Optional: verification URI with user_code pre-filled
+     */
+    verification_uri_complete?: string | null;
+};
+
+/**
+ * DTO for listing authorized devices in the user's profile.
+ */
+export type DeviceInfoDto = {
+    authorized_at?: string | null;
+    client_name: string;
+    created_at: string;
+    expires_at: string;
+    id: string;
+    scopes: string;
+    status: string;
+};
+
+/**
+ * Response to POST /api/auth/device/token when authorization is still pending
+ */
+export type DeviceTokenPendingDto = {
+    error: string;
+    error_description?: string | null;
+};
+
+/**
+ * POST /api/auth/device/token — client polls for tokens
+ */
+export type DeviceTokenRequestDto = {
+    /**
+     * The device_code received from the initial authorize call
+     */
+    device_code: string;
+    /**
+     * Must be "urn:ietf:params:oauth:grant-type:device_code"
+     */
+    grant_type?: string;
+};
+
+/**
+ * Response to POST /api/auth/device/token when authorization is complete
+ */
+export type DeviceTokenSuccessDto = {
+    access_token: string;
+    expires_in: number;
+    refresh_token: string;
+    scope: string;
+    token_type: string;
+};
+
+/**
+ * Response to POST /api/auth/device/verify — approve/deny status
+ * confirmation. Replaces the previous ad-hoc
+ * `json!({"status": "approved"})` body so the TS SDK gets a typed
+ * discriminant it can switch on.
+ */
+export type DeviceVerifyActionResponseDto = {
+    /**
+     * `"approved"` or `"denied"` — mirrors the inbound `action` the
+     * user picked.
+     */
+    status: string;
+};
+
+/**
+ * GET /api/auth/device/verify — info about the pending device code
+ */
+export type DeviceVerifyInfoDto = {
+    /**
+     * The client name requesting access
+     */
+    client_name: string;
+    /**
+     * Scopes being requested
+     */
+    scopes: string;
+    /**
+     * Whether the user_code is valid and pending
+     */
+    valid: boolean;
+};
+
+/**
+ * POST /api/auth/device/verify — user submits the code from the browser
+ */
+export type DeviceVerifyRequestDto = {
+    /**
+     * Whether the user approves ("approve") or denies ("deny")
+     */
+    action: string;
+    /**
+     * The user_code displayed on the client device
+     */
+    user_code: string;
 };
 
 /**
@@ -993,8 +1292,16 @@ export type DriveDto = {
      * Capability-flag bag — clients render UI affordances based on
      * known keys (`forbid_public_links`, `include_in_photo_index`,
      * `forbid_music_index`, …). Unknown keys preserved verbatim.
+     *
+     * `#[schema(value_type = Object)]` tightens the OpenAPI emission
+     * from "any JSON value" to `type: object, additionalProperties:
+     * true` — forward-compat for unknown keys stays, and TS SDK
+     * consumers get `{ [key: string]: unknown }` instead of a bare
+     * `unknown` they'd have to cast through every access.
      */
-    policies: unknown;
+    policies: {
+        [key: string]: unknown;
+    };
     /**
      * Storage cap in bytes. `None` means "no quota" (admin override /
      * future system drives). Mutation is OxiCloud-admin only — drive
@@ -1240,21 +1547,14 @@ export type FaceBoxDto = {
  */
 export type FavoriteItemDto = {
     /**
-     * Human-readable category (e.g. "Image", "Folder")
+     * Content category — a stable machine key, not display text (e.g.
+     * "Image", "Folder"). See `FileDto::category`.
      */
-    category: string;
+    category: ResourceCategory;
     /**
      * When the item was added to favorites
      */
     created_at: string;
-    /**
-     * FontAwesome icon CSS class (e.g. "fas fa-file-image", "fas fa-folder")
-     */
-    icon_class: string;
-    /**
-     * Extra CSS class for icon styling (e.g. "image-icon", "folder-icon")
-     */
-    icon_special_class: string;
     /**
      * Unique identifier for the favorite entry
      */
@@ -1281,9 +1581,12 @@ export type FavoriteItemDto = {
      */
     item_size?: number | null;
     /**
-     * Type of the item ('file' or 'folder')
+     * Type of the item ('file' or 'folder'). Typed enum rather than a
+     * raw string — the CHECK constraint on `favorites.item_type` enforces
+     * the same invariant, and the TS SDK gets exhaustive narrowing on
+     * the two values.
      */
-    item_type: string;
+    item_type: ItemKind;
     /**
      * Last modification timestamp of the item
      */
@@ -1293,14 +1596,22 @@ export type FavoriteItemDto = {
      */
     parent_id?: string | null;
     /**
-     * Formatted file size (e.g. "3.27 MB"); "--" for folders
-     */
-    size_formatted: string;
-    /**
      * User ID who owns this favorite
      */
     user_id: string;
 };
+
+/**
+ * Sort axis for `GET /api/favorites/resources` (§7).
+ *
+ * Typed rather than `Option<String>` so an unknown axis is refused at
+ * wire-decode time instead of silently falling back to the default. See
+ * [`crate::application::dtos::trash_dto::TrashOrderBy`] for why these are
+ * per-endpoint enums rather than one shared union: the date axis is the
+ * part that differs, and favorites' is `favorited_at`, which is
+ * meaningless on every other endpoint.
+ */
+export type FavoritesOrderBy = 'name' | 'type' | 'favorited_at' | 'modified_at' | 'size' | 'owner';
 
 /**
  * One item in a `GET /api/favorites/resources` page.
@@ -1362,6 +1673,16 @@ export type FeaturesDto = {
      */
     search: boolean;
     /**
+     * Shared-worker-backed message bus — one `/api/rt/ws`
+     * connection per BROWSER rather than per tab. Server-side wire
+     * shape is identical; the flag gates FE behaviour only.
+     * Default `true` (opt-out). See
+     * `FeaturesConfig::enable_shared_worker_bus` and
+     * `docs/plan/message-bus-via-shared-worker.md` for the rollout
+     * story and fallback matrix.
+     */
+    shared_worker_bus: boolean;
+    /**
      * File sharing (public share links + user-to-user grants). See
      * `FeaturesConfig::enable_file_sharing`.
      */
@@ -1380,13 +1701,42 @@ export type FeaturesDto = {
 };
 
 /**
+ * Wire-level view of [`FederationKind`]. Dedicated DTO rather than
+ * deriving `Serialize + ToSchema` directly on the domain enum so the
+ * hexagonal boundary stays clean — the domain stays free of
+ * serde/utoipa dependencies, and widening the enum (e.g. adding a
+ * new `SamlSso` variant) is a two-step migration (domain, then
+ * wire) rather than a single commit that may silently break clients.
+ *
+ * Wire spelling matches [`FederationKind::as_str`] exactly — the DB
+ * CHECK constraint on `auth.users.federation_kind` is the ultimate
+ * source of truth for the three canonical values.
+ */
+export type FederationKindDto = 'magic_link' | 'ocm' | 'oidc';
+
+/**
  * DTO for file responses
  */
 export type FileDto = {
     /**
-     * Human-readable file category (e.g. "Image", "Document")
+     * Coarse content category — a **stable machine key**, not display text.
+     *
+     * Values are the English identifiers `category_for` returns ("Image",
+     * "Document", "Spreadsheet", …). Clients must treat them as opaque keys:
+     * the SPA's only legitimate consumer path is
+     * `utils/resourceBuckets.ts::typeLabel`, which maps them to localised
+     * labels, plus the group-by buckets keyed off the same values. Rendering
+     * this field directly is the i18n bug step 1 of
+     * `docs/plan/retire-precomputed-display-fields.md` fixed — it showed
+     * untranslated English in the Type column for every non-English locale.
+     *
+     * This is the one display field that stays server-side, and the reason is
+     * not symmetry with the others: `category_order_for` turns it into
+     * `storage.files.category_order`, the indexed `type` sort key. Deriving
+     * it client-side would let the FE's buckets disagree with the server's
+     * `ORDER BY`. See `docs/architecture/resource-listing.md`.
      */
-    category: string;
+    category: ResourceCategory;
     /**
      * Raw BLAKE3 content hash. Populated from `File::content_hash()`.
      * Exposed in REST JSON so API consumers can use it for
@@ -1417,14 +1767,6 @@ export type FileDto = {
      * Parent folder ID
      */
     folder_id?: string | null;
-    /**
-     * FontAwesome icon CSS class (e.g. "fas fa-file-image")
-     */
-    icon_class: string;
-    /**
-     * Extra CSS class for icon styling (e.g. "image-icon", "" when default)
-     */
-    icon_special_class: string;
     /**
      * File ID
      */
@@ -1471,10 +1813,6 @@ export type FileDto = {
      * Size in bytes
      */
     size: number;
-    /**
-     * Human-readable formatted size (e.g. "3.27 MB")
-     */
-    size_formatted: string;
     /**
      * §14 provenance: user that performed the most recent mutation
      * that bumped `updated_at`. Authorship signal — distinct from
@@ -1563,9 +1901,10 @@ export type FolderAncestorsDto = {
  */
 export type FolderDto = {
     /**
-     * Human-readable category (always "Folder")
+     * Content category — a stable machine key, not display text; always
+     * "Folder". See `FileDto::category` for the contract.
      */
-    category: string;
+    category: ResourceCategory;
     /**
      * Creation timestamp (RFC 3339 UTC).
      */
@@ -1592,14 +1931,6 @@ export type FolderDto = {
      */
     etag: string;
     /**
-     * FontAwesome icon CSS class (always "fas fa-folder")
-     */
-    icon_class: string;
-    /**
-     * Extra CSS class for icon styling (always "folder-icon")
-     */
-    icon_special_class: string;
-    /**
      * Folder ID
      */
     id: string;
@@ -1612,16 +1943,16 @@ export type FolderDto = {
      */
     is_favorite: boolean;
     /**
-     * Whether this is a root folder
-     */
-    is_root: boolean;
-    /**
      * Resource-scoped: `true` when the folder has ANY explicit
      * role-grant on it. Same wire contract as `is_favorite`.
      */
     is_shared: boolean;
     /**
      * Last modification timestamp (RFC 3339 UTC).
+     *
+     * The folder row's own `updated_at` — bumped by a rename or a move of
+     * *this* folder, not by anything happening inside it. For "did anything
+     * in this subtree change", use `tree_modified_at` below.
      */
     modified_at: string;
     /**
@@ -1636,6 +1967,19 @@ export type FolderDto = {
      * Path to the folder (relative)
      */
     path: string;
+    /**
+     * Descendant-rollup timestamp (RFC 3339 UTC): the most recent change
+     * anywhere in this folder's subtree.
+     *
+     * This is what a collection's content-modification time actually means —
+     * a folder's "content" is its children — so `D:getlastmodified` is
+     * sourced from here rather than from `modified_at`, which would report a
+     * rename of the folder itself as a content change. It is also the input
+     * to `etag` below, so the two agree by construction.
+     *
+     * See `docs/architecture/dates.md` § Collections.
+     */
+    tree_modified_at: string;
     /**
      * §14 provenance: user that performed the most recent mutation
      * that bumped `updated_at`. Authorship signal — distinct from
@@ -1670,6 +2014,21 @@ export type FolderListingDto = {
      */
     shared_ids: Array<string>;
 };
+
+/**
+ * Sort axis for `GET /api/folders/{id}/resources` (§7).
+ *
+ * Typed rather than `Option<String>` so an unknown axis is refused at
+ * wire-decode time instead of silently falling back to the default. See
+ * [`crate::application::dtos::trash_dto::TrashOrderBy`] for why these are
+ * per-endpoint enums rather than one shared union.
+ *
+ * This is the folder-contents listing — the hot path behind `/files` —
+ * and the endpoint where §2 found a keyset predicate reading one column
+ * while the ORDER BY named another. Typing the axis is what stops the
+ * query builder and the cursor builder disagreeing about it.
+ */
+export type FolderOrderBy = 'name' | 'type' | 'modified_at' | 'created_at' | 'size';
 
 /**
  * One item in a `/resources` page — a file or folder with a `resource_type` tag.
@@ -1717,13 +2076,7 @@ export type FullUserDto = {
      * `None` for local users. Same rationale as `federation_kind`.
      */
     federation_issuer?: string | null;
-    /**
-     * Which trust chain minted this user's federation identity —
-     * `"oidc" | "ocm" | "magic_link"` — or `None` for pure local users.
-     * Kept off `PublicUserDto` because a peer's federation kind is a
-     * soft org-affiliation leak; only self + admin need it.
-     */
-    federation_kind?: string | null;
+    federation_kind?: null | FederationKindDto;
     /**
      * TRUE when the account has a server-verifiable password
      * (`password_hash IS NOT NULL`). Kept off `PublicUserDto` because
@@ -1839,13 +2192,6 @@ export type GroupMemberDto = {
 } | {
     id: string;
     kind: 'group';
-};
-
-/**
- * Request body for creating or renaming a group.
- */
-export type GroupNameRequest = {
-    name: string;
 };
 
 /**
@@ -2040,15 +2386,30 @@ export type HolderHeader = {
     kind: string;
 };
 
-export type ListResponseDto = {
-    items: Array<NotificationDto>;
-    /**
-     * Unread rows for this user across the whole table — the bell
-     * badge reads this. Kept on the list response so a bell open
-     * doesn't need a second round-trip for the badge.
-     */
-    unread_count: number;
-};
+/**
+ * Sort axis for `GET /api/grants/incoming/resources` — the `/shared-with-me`
+ * listing (§7).
+ *
+ * **Separate from [`OutgoingGrantOrderBy`] on purpose.** The two grant
+ * listings accept disjoint sets apart from `Name`/`Type`: "who granted this
+ * to me" only exists on the incoming side, "who did I grant it to" only on
+ * the outgoing side. They shared one `Option<String>` field until §7 part
+ * 3f, with each handler validating its own set by hand — which is how the
+ * plan's own spec came to list only two of the four values this endpoint
+ * actually accepts.
+ */
+export type IncomingGrantOrderBy = 'granted_at' | 'granted_by' | 'name' | 'type';
+
+/**
+ * What a favorite points at. The server emits exactly these two values
+ * today; the dedicated enum (rather than the 6-value `ResourceTypeDto`)
+ * matches reality — favorites hold a file or a folder, nothing else —
+ * so clients don't have to carry impossible branches for drives,
+ * calendars, address books or playlists. If a future product decision
+ * permits favoriting one of those, add the variant here and the TS SDK
+ * surfaces it on regen.
+ */
+export type ItemKind = 'file' | 'folder';
 
 /**
  * DTO for locale information
@@ -2093,7 +2454,7 @@ export type MarkAllReadResponseDto = {
     marked: number;
 };
 
-export type MergeBody = {
+export type MergePeopleRequest = {
     /**
      * Cluster id being merged into `into`. Deleted after the merge.
      */
@@ -2116,13 +2477,22 @@ export type MigrationStateDto = {
     migrated_blobs: number;
     migrated_bytes: number;
     started_at?: string | null;
-    status: string;
+    status: MigrationStatus;
     /**
      * Estimated throughput in bytes/sec (for UI ETA calculation).
      */
     throughput_bytes_per_sec?: number | null;
     total_blobs: number;
 };
+
+/**
+ * Status of a storage-migration run as the admin UI sees it. The
+ * 6 variants mirror the projection in
+ * `admin_handler::run_to_migration_dto` of the recoverable
+ * `RunStatus` + the `idle` zero-run case. `cancel_requested` folds
+ * into `paused` for display, so it doesn't surface here.
+ */
+export type MigrationStatus = 'idle' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
 
 /**
  * Payload for moving a file
@@ -2170,6 +2540,16 @@ export type NotificationDto = {
     read_at?: string | null;
 };
 
+export type NotificationListResponseDto = {
+    items: Array<NotificationDto>;
+    /**
+     * Unread rows for this user across the whole table — the bell
+     * badge reads this. Kept on the list response so a bell open
+     * doesn't need a second round-trip for the badge.
+     */
+    unread_count: number;
+};
+
 /**
  * Read-only alerting policy, from `GET /api/admin/notify/info`.
  *
@@ -2184,21 +2564,27 @@ export type NotifyInfoDto = {
      */
     email_recipients: Array<string>;
     /**
-     * Severity floor: `data_loss`, `inconsistent`, `anomaly`, or `none`.
-     *
-     * The field the panel was missing. An operator with a configured
-     * webhook and a healthy relay can still be told nothing, because the
-     * default floor admits only `data_loss` — and until this was
-     * surfaced, the only way to discover that was to read the server's
-     * environment.
+     * Severity floor. The field the panel was missing: an operator
+     * with a configured webhook and a healthy relay can still be
+     * told nothing, because the default floor admits only
+     * `data_loss`.
      */
-    min_severity: string;
+    min_severity: NotifyMinSeverity;
     /**
      * Channels actually built and wired, by name — `webhook`, `email`.
      * Empty means findings are recorded but nobody is told.
      */
     sinks: Array<string>;
 };
+
+/**
+ * Alert-severity floor on `GET /api/admin/notify/info`. 3 real
+ * severities + `None` for the "floor off" state (admits no alerts).
+ * The `None` wire value replaces the earlier `"none".to_string()`
+ * sentinel; the real severities match [`application::ports::
+ * notification_sink_ports::Severity`] canonical spellings.
+ */
+export type NotifyMinSeverity = 'none' | 'anomaly' | 'inconsistent' | 'data_loss';
 
 /**
  * One per resolved recipient. `kind` discriminates; sibling fields are
@@ -2555,6 +2941,13 @@ export type OpsBannerInput = {
 export type OpsBannerSeverity = 'warning' | 'notification';
 
 /**
+ * Sort axis for `GET /api/grants/outgoing/resources` — the `/shared`
+ * ("My Shares") listing (§7). See [`IncomingGrantOrderBy`] for why the two
+ * are separate types.
+ */
+export type OutgoingGrantOrderBy = 'first_shared_at' | 'name' | 'type' | 'subject' | 'role';
+
+/**
  * One (subject, permissions) entry within an outgoing resource item.
  */
 export type OutgoingResourceGrantDto = {
@@ -2699,23 +3092,116 @@ export type PhotoKind = 'all' | 'photo' | 'video';
  * The three axes serve distinct questions:
  *
  * - `CapturedAt` (default) — "when was this photo TAKEN". Orders by
- * `COALESCE(captured_at, created_at)` via the materialised
+ * `COALESCE(captured_at, content_modified_at)` via the materialised
  * `storage.files.media_sort_date` column, so uploads without EXIF
- * fall back to upload time rather than sinking to NULL.
+ * fall back to when their content last changed rather than sinking
+ * to NULL.
  * - `CreatedAt` — "when did this file ARRIVE in OxiCloud". Pure
  * `storage.files.created_at`; EXIF capture date ignored. Useful
  * for the operator-style "recently uploaded" view.
- * - `UpdatedAt` — "when was this file last TOUCHED". Pure
- * `storage.files.updated_at`; moves and renames resurface rows.
- * Useful when the user wants to find a file they recently acted
- * on, independent of when it was taken or first uploaded.
+ * - `ModifiedAt` (`modified_at` on the wire) — "when did this file's
+ * CONTENT last change". Reads `storage.files.content_modified_at`,
+ * so a rename, move or trash transition does *not* resurface a row
+ * — only a real content mutation does.
  *
  * All three axes paginate on the same `(sort_value, id)` keyset,
  * just over different columns. The cursor carries the axis so a
  * mid-scroll flip is rejected by the handler with 400 rather than
  * silently drifting pagination.
  */
-export type PhotoOrderBy = 'captured_at' | 'created_at' | 'updated_at';
+export type PhotoOrderBy = 'captured_at' | 'created_at' | 'modified_at';
+
+/**
+ * One item in a `GET /api/photos/resources` page.
+ *
+ * `resource_type` is always `ResourceTypeDto::File` — the listing is
+ * media-files-only — but the field stays for shape parity with other
+ * `/resources` endpoints. Clients can pattern-match on it the same
+ * way they do on favorites or trash items.
+ */
+export type PhotoResourceItemDto = {
+    /**
+     * Raw EXIF `DateTimeOriginal` (RFC 3339 UTC). `None` when the
+     * file carries no EXIF date. Lets the client distinguish "taken
+     * on this date" from the fallback that `sort_date` collapses into
+     * one value — but it is NOT a sort axis, so do not group by it.
+     */
+    captured_at?: string | null;
+    /**
+     * `true` when at least one other non-trashed media row in the
+     * same drive references the same blob hash — i.e. the §9
+     * within-drive `DISTINCT ON (blob_hash)` hid one or more
+     * siblings behind this tile. §9b Layer 1 of
+     * `docs/plan/photos-resources-migration.md` surfaces this as the
+     * delete-UX hint: a `true` tile warns the user that "trashing
+     * this removes only one copy of the content — N other copies
+     * still live elsewhere in this drive", so the gallery can offer
+     * the siblings list from `GET /api/dedup/check/{hash}` (Layer 2)
+     * before committing. `false` is the common case and lets the FE
+     * skip the sibling fetch entirely — zero round trips when
+     * there's nothing to warn about.
+     */
+    has_blob_siblings: boolean;
+    /**
+     * `true` when the file has both GPS lat AND lng. Presence signal
+     * only — the raw coordinates stay off the main listing. Enables
+     * a "📍 has location" badge and a "photos with location"
+     * client-side filter without disclosing per-photo coordinates on
+     * every gallery tile. Important on public share links where a
+     * visitor seeing GPS for every photo would often be unintended
+     * by the sharer. For the Places map, continue to use
+     * `/api/photos/geo` which clusters coords server-side; for a
+     * specific photo's exact lat/lng, call `/api/files/{id}/metadata`
+     * — the explicit per-photo call is the right disclosure
+     * boundary.
+     */
+    has_gps: boolean;
+    /**
+     * Image/video height in pixels, from `storage.content_metadata`.
+     */
+    height?: number | null;
+    /**
+     * Raw EXIF orientation (TIFF 1–8 enum). `None` when absent. The
+     * client applies this to the full-resolution image tile BEFORE
+     * pixels arrive, so there is no "appears sideways, flips" flash
+     * on `<img>` load in browsers that don't auto-rotate. Note:
+     * thumbnails already arrive display-correct — the server-side
+     * thumbnail generator bakes rotation into the output pixels.
+     * This field is strictly for the full-res lightbox / download
+     * viewer.
+     */
+    orientation?: number | null;
+    /**
+     * Full file details — serialised as the inner object via
+     * `ResourceContentDto`'s `#[serde(untagged)]`, so consumers read
+     * `resource.id`, `resource.name`, … directly.
+     */
+    resource: ResourceContentDto;
+    resource_type: ResourceTypeDto;
+    /**
+     * Value of the **active sort axis** (RFC 3339 UTC) — whichever
+     * column the server actually ordered this page by, not one fixed
+     * column. `order_by=captured_at` (the default) yields
+     * `media_sort_date`, i.e. `COALESCE(captured_at,
+     * content_modified_at)`; `order_by=created_at` yields
+     * `created_at`; `order_by=modified_at` yields
+     * `content_modified_at`. The cursor keys off this value.
+     *
+     * **Clients must bucket and group on this field**, precisely
+     * because it tracks the ordering. The timeline arrives
+     * monotonically newest-first, and a UI that groups on any other
+     * date can see a month reopen after it closed. Doing exactly that
+     * — grouping on `created_at` — is what broke `/photos` with
+     * `each_key_duplicate` once §3 made the two axes diverge.
+     */
+    sort_date: string;
+    /**
+     * Image/video width in pixels, from `storage.content_metadata`.
+     * `None` when the row has no metadata (very old uploads, or a
+     * format the metadata extractor doesn't understand).
+     */
+    width?: number | null;
+};
 
 export type PlaylistDto = {
     cover_file_id?: string | null;
@@ -2857,10 +3343,12 @@ export type PublicUserDto = {
      */
     is_online?: boolean;
     /**
-     * Role string ("admin" | "user"). Kept public because the sharee /
-     * group-member vignette renders an admin badge.
+     * Account role. Mirrors the stored `auth.users.role` — `owner` is
+     * a legitimate value, kept out of the handwritten FE `Role` type
+     * pre-pivot. Kept public because the sharee / group-member
+     * vignette renders an admin badge.
      */
-    role: string;
+    role: UserRoleDto;
     username?: string | null;
 };
 
@@ -2874,17 +3362,10 @@ export type RecentItemDto = {
      */
     accessed_at: string;
     /**
-     * Human-readable category (e.g. "Image", "Folder")
+     * Content category — a stable machine key, not display text (e.g.
+     * "Image", "Folder"). See `FileDto::category`.
      */
-    category: string;
-    /**
-     * FontAwesome icon CSS class (e.g. "fas fa-file-image", "fas fa-folder")
-     */
-    icon_class: string;
-    /**
-     * Extra CSS class for icon styling (e.g. "image-icon", "folder-icon")
-     */
-    icon_special_class: string;
+    category: ResourceCategory;
     /**
      * Unique identifier for the recent item
      */
@@ -2911,22 +3392,31 @@ export type RecentItemDto = {
      */
     item_size?: number | null;
     /**
-     * Item type ('file' or 'folder')
+     * Item type. Shared enum with `FavoriteItemDto.item_type` — both
+     * collections record a reference to one of the two leaf resource
+     * kinds, nothing else.
      */
-    item_type: string;
+    item_type: ItemKind;
     /**
      * Parent folder ID (folder_id for files, parent_id for folders)
      */
     parent_id?: string | null;
     /**
-     * Formatted file size (e.g. "3.27 MB"); "--" for folders
-     */
-    size_formatted: string;
-    /**
      * Owner user ID
      */
     user_id: string;
 };
+
+/**
+ * Sort axis for `GET /api/recent/resources` (§7).
+ *
+ * Typed rather than `Option<String>` so an unknown axis is refused at
+ * wire-decode time instead of silently falling back to the default. See
+ * [`crate::application::dtos::trash_dto::TrashOrderBy`] for why these are
+ * per-endpoint enums: `accessed_at` is recent's own date axis and means
+ * nothing on any other listing.
+ */
+export type RecentOrderBy = 'accessed_at' | 'name' | 'type' | 'modified_at' | 'size' | 'owner';
 
 /**
  * One item in a `GET /api/recent/resources` page.
@@ -2967,14 +3457,6 @@ export type RegisterDto = {
     username?: string | null;
 };
 
-export type RenameBody = {
-    /**
-     * New display name for the cluster. `null` or omitted clears
-     * the name, reverting the cluster to its "Unnamed" state.
-     */
-    name?: string | null;
-};
-
 /**
  * DTO for folder rename requests
  */
@@ -2985,9 +3467,35 @@ export type RenameFolderDto = {
     name: string;
 };
 
+export type RenamePersonRequest = {
+    /**
+     * New display name for the cluster. `null` or omitted clears
+     * the name, reverting the cluster to its "Unnamed" state.
+     */
+    name?: string | null;
+};
+
 export type ReorderTracksDto = {
     item_ids: Array<string>;
 };
+
+/**
+ * The resource categories the server classifies into — the fine set.
+ *
+ * `SearchTypeFilter` is the COARSE view of this, and the two are
+ * deliberately separate: the filter's `Document` spans Pdf, Document,
+ * Spreadsheet, Presentation, Markdown and Text, so collapsing them would
+ * either coarsen the Type column (users lose "Spreadsheet" vs "PDF") or
+ * inflate the picker to fourteen options. What IS unified is the
+ * relationship — `category_orders_for_filter` maps coarse to fine
+ * *categories*, so the sort integers appear in exactly one place
+ * ([`category_order_for`]).
+ *
+ * On the wire this is a machine key, never display text: the SPA's
+ * `typeLabel` maps it to a localised string. Rendering it raw is the i18n
+ * bug that step 1 of `retire-precomputed-display-fields.md` fixed.
+ */
+export type ResourceCategory = 'Image' | 'Video' | 'Audio' | 'PDF' | 'WordProcessor' | 'Spreadsheet' | 'Presentation' | 'Archive' | 'Code' | 'Markdown' | 'Text' | 'Package' | 'Config' | 'DiskImage' | 'Font' | 'Ebook' | 'Executable' | 'Folder' | 'Unknown';
 
 /**
  * The resource payload for one item in the shared-with-me list.
@@ -3046,7 +3554,7 @@ export type SaveOidcSettingsDto = {
  * Request body for saving storage settings from the admin panel
  */
 export type SaveStorageSettingsDto = {
-    backend: string;
+    backend: StorageBackendKind;
     /**
      * Only update if provided and non-empty (None = keep existing)
      */
@@ -3078,10 +3586,6 @@ export type SearchCriteriaDto = {
      * Optional maximum creation date (seconds since epoch)
      */
     created_before?: number | null;
-    /**
-     * Optional list of file extensions to include (e.g., "pdf", "jpg")
-     */
-    file_types?: Array<string> | null;
     /**
      * Optional folder ID to limit search scope
      */
@@ -3115,6 +3619,13 @@ export type SearchCriteriaDto = {
      */
     offset?: number;
     /**
+     * Sort dimension — see [`SearchOrderBy`]. Direction is `reverse`
+     * below; the `_desc` suffix pattern was retired 2026-07-26 in favour
+     * of a single boolean, so every consumer treats "which column" and
+     * "which direction" as orthogonal concerns.
+     */
+    order_by?: SearchOrderBy;
+    /**
      * Whether to search recursively within subfolders (default: true)
      */
     recursive?: boolean;
@@ -3124,13 +3635,20 @@ export type SearchCriteriaDto = {
      */
     reverse?: boolean;
     /**
-     * Sort dimension. Canonical set: `"relevance"` | `"name"` | `"size"`
-     * | `"updated_at"` | `"created_at"`. Direction is `reverse` below —
-     * the `_desc` suffix pattern was retired 2026-07-26 in favour of
-     * a single boolean, so every consumer treats "which column" and
-     * "which direction" as orthogonal concerns.
+     * Resource-category narrowing — see [`SearchTypeFilter`].
+     *
+     * Was `file_types: Option<Vec<String>>`, a list of filename extensions
+     * the SPA assembled. Carrying the category instead keeps the
+     * extension→category table on the server (one copy, next to
+     * `category_order_for`) and lets the SQL filter on the indexed
+     * `storage.files.category_order` rather than re-deriving an extension
+     * from the name at query time.
+     *
+     * Not `Option`: `All` is the honest default, and a `Copy` enum also
+     * makes this struct's `Hash` — which keys the search result cache —
+     * cheaper and stabler than a `Vec<String>` whose order could vary.
      */
-    sort_by?: string;
+    type_filter?: SearchTypeFilter;
 };
 
 /**
@@ -3155,9 +3673,13 @@ export type SearchFileResultDto = {
      */
     blob_hash?: string;
     /**
-     * Content category: "document", "image", "video", "audio", "archive", "code", "other"
+     * Coarse content category — a stable machine key, not display text.
+     * Carried through from `FileDto::category`; see that field for the full
+     * contract. (This comment used to claim lowercase values — "document",
+     * "image", … — which it never carried: `enrich_file` copies the
+     * capitalised `category_for` output verbatim.)
      */
-    category: string;
+    category: ResourceCategory;
     /**
      * Creation timestamp (RFC 3339 UTC).
      */
@@ -3178,14 +3700,6 @@ export type SearchFileResultDto = {
      * Parent folder ID
      */
     folder_id?: string | null;
-    /**
-     * CSS icon class for the file type (e.g., "fas fa-file-pdf")
-     */
-    icon_class: string;
-    /**
-     * Extra CSS class for icon styling (e.g., "pdf-icon", "code-icon js-icon")
-     */
-    icon_special_class: string;
     /**
      * File ID
      */
@@ -3232,10 +3746,6 @@ export type SearchFileResultDto = {
      * Size in bytes
      */
     size: number;
-    /**
-     * Human-readable file size (e.g., "2.5 MB")
-     */
-    size_formatted: string;
     /**
      * Plain-text fragment around the first content match, present only for
      * hits discovered through the full-text content index.
@@ -3284,10 +3794,6 @@ export type SearchFolderResultDto = {
      * this folder. EXISTS on `auth.user_favorites`.
      */
     is_favorite?: boolean;
-    /**
-     * Whether it is a root folder
-     */
-    is_root: boolean;
     /**
      * Resource-scoped: `true` when the folder has any explicit
      * role-grant. EXISTS on `storage.role_grants`.
@@ -3344,6 +3850,27 @@ export type SearchMeta = {
      */
     via?: string | null;
 };
+
+/**
+ * Sort axis for `GET /api/search` (§7).
+ *
+ * Typed rather than `String` so an unknown axis is refused at
+ * wire-decode time instead of silently falling back to the default. See
+ * [`crate::application::dtos::trash_dto::TrashOrderBy`] for why these are
+ * per-endpoint enums rather than one shared union — `Relevance` only
+ * exists here, and is meaningless on every other listing.
+ *
+ * Direction is the orthogonal `reverse` boolean, NOT a `_desc` suffix on
+ * the axis. That pattern was retired 2026-07-26; typing the axis is what
+ * finally made the leftover `name_desc` / `date` / `date_desc` arms in
+ * the recursive search path impossible to leave lying around (§7 part
+ * 3e — they were dead spellings whose presence hid a real bug, see
+ * `sort_enriched_folders`).
+ *
+ * `Hash` is required: this rides on `SearchCriteriaDto`, which is hashed
+ * to key the search result cache.
+ */
+export type SearchOrderBy = 'relevance' | 'name' | 'size' | 'modified_at' | 'created_at';
 
 /**
  * One search result — same `resource_type + resource` shape as the
@@ -3418,13 +3945,13 @@ export type SearchResultsDto = {
      */
     offset: number;
     /**
+     * Sort order used
+     */
+    order_by: SearchOrderBy;
+    /**
      * Query execution time in milliseconds (server-side)
      */
     query_time_ms: number;
-    /**
-     * Sort order used
-     */
-    sort_by: string;
     /**
      * Total count of matching items (for pagination)
      */
@@ -3436,14 +3963,6 @@ export type SearchResultsDto = {
  */
 export type SearchSuggestionItem = {
     /**
-     * CSS icon class
-     */
-    icon_class: string;
-    /**
-     * Extra CSS class for icon styling
-     */
-    icon_special_class: string;
-    /**
      * Item ID for navigation
      */
     id: string;
@@ -3451,6 +3970,15 @@ export type SearchSuggestionItem = {
      * Type: "file" or "folder"
      */
     item_type: string;
+    /**
+     * MIME type, so the client can pick its own glyph.
+     *
+     * Replaced `icon_class` (a CSS class string) in step 4 of
+     * `docs/plan/retire-precomputed-display-fields.md`. Folders carry
+     * `"directory"`, matching the convention elsewhere in the storage layer —
+     * clients branch on `item_type` for those and never consult this.
+     */
+    mime_type: string;
     /**
      * The suggested name
      */
@@ -3478,6 +4006,29 @@ export type SearchSuggestionsDto = {
      */
     suggestions: Array<SearchSuggestionItem>;
 };
+
+/**
+ * Resource-category filter for `GET /api/search` (`?type=`).
+ *
+ * Replaces a comma-separated **extension** list (`type=pdf,docx`) matched
+ * against the filename. That shape had three defects, all fixed by moving the
+ * classification server-side:
+ *
+ * * the category→extension table lived in the SPA (12 image and 7 audio
+ * extensions hardcoded), so a missed extension silently dropped a file from
+ * its own category;
+ * * extensionless files could never match — the predicate was
+ * `SUBSTRING(name FROM '\.([^.]+)$')`, NULL without a dot, even when
+ * `mime_type` was known;
+ * * folders were never filtered at all, which is the defect a user saw.
+ *
+ * `All` and `Folders` deliberately map to no `storage.files` value: a folder
+ * has no row in that table, so those two cases select which UNION branches
+ * run rather than contributing a predicate. Every other variant resolves
+ * through [`category_orders_for_filter`], which is exhaustive over this enum
+ * so a new variant is a compile error there.
+ */
+export type SearchTypeFilter = 'all' | 'folder' | 'image' | 'video' | 'audio' | 'document' | 'archive' | 'code' | 'font' | 'unknown';
 
 /**
  * Self view — everything the caller may see about themselves.
@@ -3522,8 +4073,16 @@ export type SelfUserDto = {
      * for pure UI toggles (view mode, sidebar collapse, hide dotfiles,
      * …). The server never inspects the contents. Always present on
      * the wire; empty bag is `{}`, never `null`.
+     *
+     * `#[schema(value_type = Object)]`: see `drive_dto.rs::policies`
+     * for the full rationale — in short, this tightens the emitted
+     * schema from "any JSON value" to "an object with unknown keys"
+     * so TS SDK consumers get `{ [key: string]: unknown }` instead
+     * of a bare `unknown`.
      */
-    ui_preferences: unknown;
+    ui_preferences: {
+        [key: string]: unknown;
+    };
 };
 
 /**
@@ -3827,9 +4386,9 @@ export type SmtpInfoDto = {
      */
     port: number;
     /**
-     * Transport encryption mode: `"starttls"`, `"tls"`, or `"none"`.
+     * Transport encryption mode.
      */
-    tls: string;
+    tls: SmtpTlsModeDto;
     /**
      * `<set>` if a SASL user is configured, `<anon>` otherwise.
      * Never echoes the username — admins compare against the
@@ -3862,6 +4421,12 @@ export type SmtpTestResultDto = {
 };
 
 /**
+ * Wire-level view of [`common::config::SmtpTlsMode`]. Kept DTO-
+ * suffixed because the domain name clashes.
+ */
+export type SmtpTlsModeDto = 'starttls' | 'tls' | 'none';
+
+/**
  * Request body for `POST /api/admin/storage/migration/start`.
  *
  * **Multi-entry contract** (see `docs/plan/storage-multi-entry.md`):
@@ -3891,38 +4456,17 @@ export type StartMigrationDto = {
 };
 
 /**
- * Response for dedup stats endpoint
+ * Which blob backend an entry / request targets. Wire values are
+ * `"local"`, `"s3"`, `"azure"` — the three implementations in
+ * `infrastructure::services::{local,s3,azure}_blob_backend`. The
+ * three producers across those modules (and the local storage-
+ * settings service) all previously populated this as a raw string
+ * literal; the shared enum makes the OpenAPI spec exhaustive and
+ * gives the FE SDK a typed union to switch on.
+ *
+ * Serialized as lowercase to match the historical wire shape.
  */
-export type StatsResponse = {
-    /**
-     * Total bytes saved by deduplication
-     */
-    bytes_saved: number;
-    /**
-     * Deduplication ratio (logical / physical)
-     */
-    dedup_ratio: number;
-    /**
-     * Percentage of storage saved
-     */
-    savings_percentage: number;
-    /**
-     * Total logical bytes (what users think they have)
-     */
-    total_logical_bytes: number;
-    /**
-     * Total physical bytes (actual disk usage)
-     */
-    total_physical_bytes: number;
-    /**
-     * Total number of references (files pointing to blobs)
-     */
-    total_references: number;
-    /**
-     * Total number of unique blobs stored
-     */
-    unique_blobs: number;
-};
+export type StorageBackendKind = 'local' | 's3' | 'azure';
 
 /**
  * One `<cipher>:<key>` pair rendered for the admin UI. Never
@@ -3958,9 +4502,9 @@ export type StorageEncryptionPairDto = {
  */
 export type StorageEntrySummaryDto = {
     /**
-     * Backend type — "local" / "s3" / "azure".
+     * Which backend this entry targets.
      */
-    backend: string;
+    backend: StorageBackendKind;
     /**
      * True when the entry has a per-entry encryption key. UI shows
      * a lock icon. Presence-only — the key bytes never leave the
@@ -4024,14 +4568,13 @@ export type StorageSettingsDto = {
     active_entry_name: string;
     backend_write_lock?: null | BackendWriteLockReason;
     /**
-     * Backend type currently in use (`"local"` / `"s3"` / `"azure"`) —
-     * what the LIVE `blob_backend` is bound to, from
-     * `blob_handler.backend().backend_type()`. Redundant with
-     * `entries[i where is_active].backend` in multi-entry mode; kept
-     * because pre-boot / mid-migration inspection may still find it
-     * useful.
+     * Backend type currently in use — what the LIVE `blob_backend` is
+     * bound to, from `blob_handler.backend().backend_type()`. Redundant
+     * with `entries[i where is_active].backend` in multi-entry mode;
+     * kept because pre-boot / mid-migration inspection may still find
+     * it useful.
      */
-    current_backend: string;
+    current_backend: StorageBackendKind;
     dedup_ratio: number;
     /**
      * All named storage entries declared in env. Empty when running
@@ -4084,7 +4627,7 @@ export type SubjectTypeDto = 'user' | 'group' | 'token';
 /**
  * System initialisation state, returned by `GET /api/auth/status`.
  */
-export type SystemStatus = {
+export type SystemInitStatusDto = {
     /**
      * Number of admin users in the system.
      */
@@ -4186,19 +4729,33 @@ export type TranslationResponseDto = {
 };
 
 /**
+ * Sort axis for `GET /api/trash/resources` (§7).
+ *
+ * Typed rather than `Option<String>` so an unknown axis is refused at
+ * wire-decode time instead of silently falling back to the default —
+ * which is what a bare string did, turning a client typo into "sorted by
+ * something else" with a 200. serde's derived error names the accepted
+ * variants, so the 400 tells the caller what to send; no custom extractor
+ * is involved. `PhotoOrderBy` set this precedent in §6.
+ *
+ * **Per-endpoint by design, not one shared union.** `Name`/`Type`/`Size`
+ * recur across endpoints but the date axes do not — trash has
+ * `expires_at`/`trashed_at`, favorites has `favorited_at`, recent has
+ * `accessed_at`. A shared enum would accept nonsense on every endpoint
+ * but its own.
+ */
+export type TrashOrderBy = 'expires_at' | 'trashed_at' | 'name' | 'type' | 'size';
+
+/**
  * One item in a `GET /api/trash/resources` page.
  *
- * `deletion_date` is the real timestamp at which the item will be permanently
+ * `expires_at` is the real timestamp at which the item will be permanently
  * deleted (= `trashed_at + retention_days`). The client derives "days until
  * deletion" itself from this + the current clock — the wire format does not
  * duplicate that derivation. `resource.path` carries the original location
  * (soft-delete preserves the row's `path` column).
  */
 export type TrashResourceItemDto = {
-    /**
-     * When the item will be permanently deleted by the retention sweeper.
-     */
-    deletion_date: string;
     /**
      * The drive the trashed item belongs to. Enables client-side
      * group-by-drive in the `/trash` UI (D2b spec — see
@@ -4207,6 +4764,10 @@ export type TrashResourceItemDto = {
      * holds in `drives.svelte` — no extra round-trip needed.
      */
     drive_id: string;
+    /**
+     * When the item will be permanently deleted by the retention sweeper.
+     */
+    expires_at: string;
     /**
      * Full resource details — shape determined by `resource_type`.
      */
@@ -4223,18 +4784,11 @@ export type TrashResourceItemDto = {
  */
 export type TrashedItemDto = {
     /**
-     * Human-readable category (e.g., "Image", "Folder", "Document")
+     * Content category — a stable machine key, not display text (e.g.
+     * "Image", "Folder", "Document"). See `FileDto::category`.
      */
-    category: string;
+    category: ResourceCategory;
     days_until_deletion: number;
-    /**
-     * FontAwesome icon class for the file type
-     */
-    icon_class: string;
-    /**
-     * Special CSS class for icon styling (e.g., "image-icon", "pdf-icon")
-     */
-    icon_special_class: string;
     id: string;
     item_type: string;
     name: string;
@@ -4349,6 +4903,20 @@ export type UpdateDriveQuotaDto = {
     quota_bytes?: number | null;
 };
 
+/**
+ * `PUT /api/grants/role` — reconcile a subject's role on a resource.
+ */
+export type UpdateGrantRoleDto = {
+    /**
+     * Optional expiry applied to every grant written or updated by this call.
+     * Accepts both wire shapes — see [`CreateGrantDto::expires_at`].
+     */
+    expires_at?: string | null;
+    resource: ResourceDto;
+    role: RoleDto;
+    subject: SubjectDto;
+};
+
 export type UpdateGroupRequest = {
     /**
      * Reserved for future use; v1 only persists the name in `rename`.
@@ -4426,8 +4994,16 @@ export type UpdateProfileDto = {
      *
      * Absent → no change to the bag. This is a UI-only surface;
      * server never inspects the keys.
+     *
+     * `#[schema(value_type = Option<Object>)]`: see
+     * `drive_dto.rs::policies` for the full rationale — tightens the
+     * emitted schema from "any JSON value" to "an object with
+     * unknown keys", so inbound-DTO TS SDK consumers get an optional
+     * `{ [key: string]: unknown }` instead of an optional `unknown`.
      */
-    ui_preferences?: unknown;
+    ui_preferences?: {
+        [key: string]: unknown;
+    } | null;
     /**
      * Handle to claim (2-64 chars, `[A-Za-z0-9._-]+`, no `@`).
      * Accepted only when the caller currently has no username. Once
@@ -4438,20 +5014,6 @@ export type UpdateProfileDto = {
      * the escape hatch for genuine typos.
      */
     username?: string | null;
-};
-
-/**
- * `PUT /api/grants/role` — reconcile a subject's role on a resource.
- */
-export type UpdateRoleDto = {
-    /**
-     * Optional expiry applied to every grant written or updated by this call.
-     * Accepts both wire shapes — see [`CreateGrantDto::expires_at`].
-     */
-    expires_at?: string | null;
-    resource: ResourceDto;
-    role: RoleDto;
-    subject: SubjectDto;
 };
 
 export type UpdateShareDto = {
@@ -4470,6 +5032,16 @@ export type UpdateUserActiveDto = {
 };
 
 /**
+ * DTO for updating the user's profile image.
+ */
+export type UpdateUserImageDto = {
+    /**
+     * Image URL (https/http) or data URI (data:image/png|webp|jpeg;base64,…). Null to clear.
+     */
+    image?: string | null;
+};
+
+/**
  * Request body for updating a user's storage quota
  */
 export type UpdateUserQuotaDto = {
@@ -4480,10 +5052,16 @@ export type UpdateUserQuotaDto = {
 };
 
 /**
- * Request body for updating a user's role
+ * Request body for updating a user's role. The service layer refuses
+ * `UserRoleDto::Owner` on this endpoint — conferring ownership would
+ * create a second owner rather than move the one that exists; use
+ * [`TransferOwnershipDto`] for that. Reusing `UserRoleDto` keeps a
+ * single wire shape across the FE (consumer sees the same 3-value
+ * enum on reads and writes); the owner-refusal remains a service-
+ * level invariant.
  */
 export type UpdateUserRoleDto = {
-    role: string;
+    role: UserRoleDto;
 };
 
 /**
@@ -4518,6 +5096,19 @@ export type UploadStatusResponseDto = {
     upload_id: string;
 };
 
+/**
+ * Account role as carried on `PublicUserDto` and inbound on
+ * `UpdateUserRoleDto`. Mirrors the three stored values of
+ * [`UserRole`] — `Anonymous` is a session-only domain variant and
+ * never appears on a persisted row, so it is deliberately absent
+ * from this wire shape.
+ *
+ * The DB CHECK constraint on `auth.users.role` is the ultimate
+ * source of truth for the three canonical values; parse errors
+ * through [`UserRoleDto::from_str`] mean a corrupt row.
+ */
+export type UserRoleDto = 'owner' | 'admin' | 'user';
+
 export type VerifyPasswordRequest = {
     password: string;
 };
@@ -4542,6 +5133,13 @@ export type WeakerDriveDto = {
 };
 
 /**
+ * Which JSON shape a webhook sink POSTs. Wire mirror of
+ * [`infrastructure::services::webhook_notification_sink::WebhookFormat`] —
+ * kept DTO-suffixed because the domain name clashes.
+ */
+export type WebhookFormatDto = 'generic' | 'slack' | 'discord' | 'teams' | 'telegram' | 'ntfy';
+
+/**
  * Read-only webhook info, shown beside SMTP on the admin Notifications
  * page. Like SMTP, configured only through environment variables.
  */
@@ -4551,9 +5149,9 @@ export type WebhookInfoDto = {
      */
     enabled: boolean;
     /**
-     * `generic`, `slack`, `discord`, `teams`, `telegram` or `ntfy`.
+     * Which webhook JSON shape this sink speaks.
      */
-    format: string;
+    format: WebhookFormatDto;
     /**
      * Scheme and host of the endpoint — **never the full URL**.
      *
@@ -4727,6 +5325,10 @@ export type ListContactsData = {
          * Pagination offset (omit for none; system book defaults to 0)
          */
         offset?: number;
+        /**
+         * System address book only — include the calling user in the results. Default false (the share-modal "can't share with yourself" rule); the admin drive-owner surface sets it true. Ignored for non-system books
+         */
+        include_self?: boolean;
     };
     url: '/api/address-books/{book_id}/contacts';
 };
@@ -4940,7 +5542,7 @@ export type ListGroupsResponses = {
 export type ListGroupsResponse = ListGroupsResponses[keyof ListGroupsResponses];
 
 export type CreateGroupData = {
-    body: GroupNameRequest;
+    body: ContactGroupNameRequest;
     path: {
         /**
          * Address book UUID
@@ -5044,7 +5646,7 @@ export type GetGroupResponses = {
 export type GetGroupResponse = GetGroupResponses[keyof GetGroupResponses];
 
 export type UpdateGroupData = {
-    body: GroupNameRequest;
+    body: ContactGroupNameRequest;
     path: {
         /**
          * Address book UUID
@@ -5116,7 +5718,7 @@ export type ListContactsInGroupResponses = {
 export type ListContactsInGroupResponse = ListContactsInGroupResponses[keyof ListContactsInGroupResponses];
 
 export type AddContactToGroupData = {
-    body: AddMemberRequest;
+    body: AddContactToGroupRequest;
     path: {
         /**
          * Address book UUID
@@ -5422,7 +6024,7 @@ export type RecalculateStatsResponses = {
     /**
      * Statistics after integrity verification
      */
-    200: StatsResponse;
+    200: DedupStatsResponse;
 };
 
 export type RecalculateStatsResponse = RecalculateStatsResponses[keyof RecalculateStatsResponses];
@@ -5449,7 +6051,7 @@ export type GetStatsResponses = {
     /**
      * Deduplication statistics
      */
-    200: StatsResponse;
+    200: DedupStatsResponse;
 };
 
 export type GetStatsResponse = GetStatsResponses[keyof GetStatsResponses];
@@ -7130,6 +7732,96 @@ export type SendWebhookTestResponses = {
 
 export type SendWebhookTestResponse = SendWebhookTestResponses[keyof SendWebhookTestResponses];
 
+export type ListAppPasswordsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/auth/app-passwords';
+};
+
+export type ListAppPasswordsErrors = {
+    /**
+     * Caller is not signed in
+     */
+    401: unknown;
+};
+
+export type ListAppPasswordsResponses = {
+    /**
+     * The caller's app passwords (metadata only, no plain text)
+     */
+    200: AppPasswordListResponseDto;
+};
+
+export type ListAppPasswordsResponse = ListAppPasswordsResponses[keyof ListAppPasswordsResponses];
+
+export type CreateAppPasswordData = {
+    body: CreateAppPasswordRequestDto;
+    path?: never;
+    query?: never;
+    url: '/api/auth/app-passwords';
+};
+
+export type CreateAppPasswordErrors = {
+    /**
+     * Caller is not signed in
+     */
+    401: unknown;
+    /**
+     * External users cannot mint app passwords
+     */
+    403: unknown;
+    /**
+     * Caller has no claimed username — app password is unusable without one
+     */
+    409: unknown;
+};
+
+export type CreateAppPasswordResponses = {
+    /**
+     * App password created — `password` is plain-text and shown exactly ONCE
+     */
+    200: AppPasswordCreatedResponseDto;
+};
+
+export type CreateAppPasswordResponse = CreateAppPasswordResponses[keyof CreateAppPasswordResponses];
+
+export type RevokeAppPasswordData = {
+    body?: never;
+    path: {
+        /**
+         * App-password UUID returned by the create endpoint
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/api/auth/app-passwords/{id}';
+};
+
+export type RevokeAppPasswordErrors = {
+    /**
+     * `id` is not a valid UUID
+     */
+    400: unknown;
+    /**
+     * Caller is not signed in
+     */
+    401: unknown;
+    /**
+     * No app password with this id for the caller
+     */
+    404: unknown;
+};
+
+export type RevokeAppPasswordResponses = {
+    /**
+     * App password revoked — subsequent Basic-Auth with it returns 401
+     */
+    200: AppPasswordRevokeResponseDto;
+};
+
+export type RevokeAppPasswordResponse = RevokeAppPasswordResponses[keyof RevokeAppPasswordResponses];
+
 export type ChangePasswordData = {
     body: ChangePasswordDto;
     path?: never;
@@ -7158,6 +7850,157 @@ export type ChangePasswordResponses = {
 };
 
 export type ChangePasswordResponse = ChangePasswordResponses[keyof ChangePasswordResponses];
+
+export type DeviceAuthorizeData = {
+    body: DeviceAuthorizeRequestDto;
+    path?: never;
+    query?: never;
+    url: '/api/auth/device/authorize';
+};
+
+export type DeviceAuthorizeResponses = {
+    /**
+     * Device flow initiated — hand `user_code` to the end user
+     */
+    200: DeviceAuthorizeResponseDto;
+};
+
+export type DeviceAuthorizeResponse = DeviceAuthorizeResponses[keyof DeviceAuthorizeResponses];
+
+export type ListDevicesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/auth/device/devices';
+};
+
+export type ListDevicesErrors = {
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+};
+
+export type ListDevicesResponses = {
+    /**
+     * The caller's authorized devices
+     */
+    200: Array<DeviceInfoDto>;
+};
+
+export type ListDevicesResponse = ListDevicesResponses[keyof ListDevicesResponses];
+
+export type RevokeDeviceData = {
+    body?: never;
+    path: {
+        /**
+         * The device-code row id (`device_codes.id`, UUID)
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/api/auth/device/devices/{id}';
+};
+
+export type RevokeDeviceErrors = {
+    /**
+     * Invalid device id
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+};
+
+export type RevokeDeviceResponses = {
+    /**
+     * Revoked
+     */
+    204: void;
+};
+
+export type RevokeDeviceResponse = RevokeDeviceResponses[keyof RevokeDeviceResponses];
+
+export type DeviceTokenData = {
+    body: DeviceTokenRequestDto;
+    path?: never;
+    query?: never;
+    url: '/api/auth/device/token';
+};
+
+export type DeviceTokenErrors = {
+    /**
+     * RFC 8628 error — `authorization_pending`, `slow_down`, `access_denied`, `expired_token`, …
+     */
+    400: DeviceTokenPendingDto;
+};
+
+export type DeviceTokenError = DeviceTokenErrors[keyof DeviceTokenErrors];
+
+export type DeviceTokenResponses = {
+    /**
+     * Authorization granted — tokens issued
+     */
+    200: DeviceTokenSuccessDto;
+};
+
+export type DeviceTokenResponse = DeviceTokenResponses[keyof DeviceTokenResponses];
+
+export type DeviceVerifyInfoData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * The user_code the client is displaying (hyphen-separated, e.g. `ABCD-1234`)
+         */
+        code: string;
+    };
+    url: '/api/auth/device/verify';
+};
+
+export type DeviceVerifyInfoErrors = {
+    /**
+     * Caller is not signed in — the user must authenticate before approving a device
+     */
+    401: unknown;
+};
+
+export type DeviceVerifyInfoResponses = {
+    /**
+     * Info about the pending authorization — `valid: false` means the code is unknown or expired
+     */
+    200: DeviceVerifyInfoDto;
+};
+
+export type DeviceVerifyInfoResponse = DeviceVerifyInfoResponses[keyof DeviceVerifyInfoResponses];
+
+export type DeviceVerifyActionData = {
+    body: DeviceVerifyRequestDto;
+    path?: never;
+    query?: never;
+    url: '/api/auth/device/verify';
+};
+
+export type DeviceVerifyActionErrors = {
+    /**
+     * `action` was not one of `approve`/`deny`
+     */
+    400: unknown;
+    /**
+     * Caller is not signed in
+     */
+    401: unknown;
+};
+
+export type DeviceVerifyActionResponses = {
+    /**
+     * Decision recorded — `status` echoes `approved` or `denied`
+     */
+    200: DeviceVerifyActionResponseDto;
+};
+
+export type DeviceVerifyActionResponse = DeviceVerifyActionResponses[keyof DeviceVerifyActionResponses];
 
 export type DpopBindData = {
     body: DpopBindDto;
@@ -7300,6 +8143,31 @@ export type GetCurrentUserResponses = {
 };
 
 export type GetCurrentUserResponse = GetCurrentUserResponses[keyof GetCurrentUserResponses];
+
+export type UpdateUserImageData = {
+    body: UpdateUserImageDto;
+    path?: never;
+    query?: never;
+    url: '/api/auth/me/image';
+};
+
+export type UpdateUserImageErrors = {
+    /**
+     * Validation error (invalid data URI / unsupported MIME / oversized / malformed URL)
+     */
+    400: unknown;
+    /**
+     * Not authenticated
+     */
+    401: unknown;
+};
+
+export type UpdateUserImageResponses = {
+    /**
+     * Image updated (or cleared when `image` was null)
+     */
+    200: unknown;
+};
 
 export type UpdateProfileData = {
     body: UpdateProfileDto;
@@ -7767,7 +8635,7 @@ export type GetSystemStatusResponses = {
     /**
      * System status
      */
-    200: SystemStatus;
+    200: SystemInitStatusDto;
 };
 
 export type GetSystemStatusResponse = GetSystemStatusResponses[keyof GetSystemStatusResponses];
@@ -8782,10 +9650,11 @@ export type ListFavoritesResourcesData = {
          */
         cursor?: string | null;
         /**
-         * Sort / group-by dimension. Supported: `"name"` (default), `"type"`,
-         * `"favorited_at"`, `"modified_at"`, `"size"`, `"owner"`.
+         * Sort / group-by dimension — see [`FavoritesOrderBy`]. Omit for
+         * `name`. An unknown value is a 400 naming the accepted set, not a
+         * silent fall back to the default.
          */
-        order_by?: string | null;
+        order_by?: null | FavoritesOrderBy;
         /**
          * Comma-separated resource types to include, e.g. `"file,folder"`.
          * Omit to include both.
@@ -9637,10 +10506,11 @@ export type ListFolderResourcesData = {
          */
         cursor?: string | null;
         /**
-         * Sort / group-by dimension. Supported: `"name"` (default), `"type"`,
-         * `"modified_at"`, `"created_at"`, `"size"`.
+         * Sort / group-by dimension — see [`FolderOrderBy`]. Omit for
+         * `name`. An unknown value is a 400 naming the accepted set, not a
+         * silent fall back to the default.
          */
-        order_by?: string | null;
+        order_by?: null | FolderOrderBy;
         /**
          * Comma-separated resource types to include, e.g. `"file,folder"`.
          * Omit to include both.
@@ -9759,10 +10629,10 @@ export type ListSharedWithMeData = {
          */
         cursor?: string | null;
         /**
-         * Sort dimension. Supported values: `"granted_at"` (default),
-         * `"granted_by"` (for swimlane grouping).
+         * Sort dimension — see [`IncomingGrantOrderBy`]. Omit for
+         * `granted_at`. An unknown value is a 400 naming the accepted set.
          */
-        sort_by?: string | null;
+        order_by?: null | IncomingGrantOrderBy;
         /**
          * Comma-separated resource types to include, e.g. `file,folder`.
          * Omit to return all known types.
@@ -9813,14 +10683,14 @@ export type ListMySharesData = {
         limit?: number;
         /**
          * Opaque cursor from a previous response. Omit to start from the
-         * most-recently-granted item.
+         * most-recently-shared item.
          */
         cursor?: string | null;
         /**
-         * Sort dimension. Supported values: `"granted_at"` (default),
-         * `"granted_by"` (for swimlane grouping).
+         * Sort dimension — see [`OutgoingGrantOrderBy`]. Omit for
+         * `first_shared_at`. An unknown value is a 400 naming the accepted set.
          */
-        sort_by?: string | null;
+        order_by?: null | OutgoingGrantOrderBy;
         /**
          * Comma-separated resource types to include, e.g. `file,folder`.
          * Omit to return all known types.
@@ -9828,8 +10698,6 @@ export type ListMySharesData = {
         resource_types?: string | null;
         /**
          * Reverse the sort order. Default `false` (normal order).
-         * Must be the same on all pages of the same result set — the cursor
-         * carries this flag so the server can validate consistency.
          */
         reverse?: boolean;
     };
@@ -9846,7 +10714,7 @@ export type ListMySharesResponses = {
 export type ListMySharesResponse = ListMySharesResponses[keyof ListMySharesResponses];
 
 export type SetRoleData = {
-    body: UpdateRoleDto;
+    body: UpdateGrantRoleDto;
     path?: never;
     query?: never;
     url: '/api/grants/role';
@@ -10465,7 +11333,7 @@ export type ListNotificationsResponses = {
     /**
      * List of notifications
      */
-    200: ListResponseDto;
+    200: NotificationListResponseDto;
 };
 
 export type ListNotificationsResponse = ListNotificationsResponses[keyof ListNotificationsResponses];
@@ -10623,7 +11491,7 @@ export type FacesForFileResponses = {
 export type FacesForFileResponse = FacesForFileResponses[keyof FacesForFileResponses];
 
 export type MergePeopleData = {
-    body: MergeBody;
+    body: MergePeopleRequest;
     path?: never;
     query?: never;
     url: '/api/people/merge';
@@ -10671,7 +11539,7 @@ export type ReclusterResponses = {
 };
 
 export type RenamePersonData = {
-    body: RenameBody;
+    body: RenamePersonRequest;
     path: {
         /**
          * Person cluster id
@@ -10848,7 +11716,20 @@ export type ListPhotosResourcesResponse = ListPhotosResourcesResponses[keyof Lis
 export type ListPlaylistsData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Include playlists shared with the caller, not just owned ones
+         */
+        include_shared?: boolean;
+        /**
+         * Accepted for backwards compatibility but NOT applied — the listing is derived from the caller's grants and always returns all of them. See PlaylistQueryDto
+         */
+        limit?: number;
+        /**
+         * Accepted for backwards compatibility but NOT applied — see `limit`
+         */
+        offset?: number;
+    };
     url: '/api/playlists';
 };
 
@@ -11286,10 +12167,11 @@ export type ListRecentResourcesData = {
          */
         cursor?: string | null;
         /**
-         * Sort / group-by dimension. Supported: `"accessed_at"` (default), `"name"`,
-         * `"type"`, `"modified_at"`, `"size"`, `"owner"`.
+         * Sort / group-by dimension — see [`RecentOrderBy`]. Omit for
+         * `accessed_at`. An unknown value is a 400 naming the accepted set,
+         * not a silent fall back to the default.
          */
-        order_by?: string | null;
+        order_by?: null | RecentOrderBy;
         /**
          * Comma-separated resource types to include, e.g. `"file,folder"`.
          * Omit to include both.
@@ -11468,9 +12350,9 @@ export type SearchResourcesData = {
          */
         cursor?: string;
         /**
-         * Sort dimension: relevance (default) | name | size | updated_at | created_at
+         * Sort axis; direction is the separate `reverse` flag
          */
-        order_by?: string;
+        order_by?: SearchOrderBy;
         /**
          * Comma-separated: file, folder (both by default)
          */
@@ -11480,9 +12362,9 @@ export type SearchResourcesData = {
          */
         reverse?: boolean;
         /**
-         * Filter by file extensions (comma-separated)
+         * Narrow to one resource category; `folders` returns folders only
          */
-        type?: string;
+        type?: SearchTypeFilter;
         /**
          * Restrict search to this folder
          */
@@ -11601,7 +12483,24 @@ export type SetupAdminResponse = SetupAdminResponses[keyof SetupAdminResponses];
 export type GetUserSharesData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * 1-based page number (default 1). Ignored when item_id + item_type are both given
+         */
+        page?: number;
+        /**
+         * Items per page (default 20). Ignored when item_id + item_type are both given
+         */
+        per_page?: number;
+        /**
+         * Return only shares for this item. Must be sent together with item_type
+         */
+        item_id?: string;
+        /**
+         * Item kind for item_id — `file` or `folder`. An unknown value returns 400
+         */
+        item_type?: string;
+    };
     url: '/api/shares';
 };
 
@@ -11853,11 +12752,11 @@ export type GetTrashResourcesData = {
          */
         cursor?: string | null;
         /**
-         * Sort / group-by dimension. Supported: `"deletion_date"` (default — soonest
-         * expiry first), `"trashed_at"` (most recently trashed first), `"name"`,
-         * `"type"`, `"size"`.
+         * Sort / group-by dimension — see [`TrashOrderBy`]. Omit for
+         * `expires_at` (soonest expiry first). An unknown value is a 400
+         * naming the accepted set, not a silent fall back to the default.
          */
-        order_by?: string | null;
+        order_by?: null | TrashOrderBy;
         /**
          * Comma-separated resource types to include, e.g. `"file,folder"`.
          * Omit to include both.

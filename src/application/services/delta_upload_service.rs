@@ -51,7 +51,7 @@ use crate::infrastructure::services::pg_acl_engine::PgAclEngine;
 /// One chunk reference: `h` = BLAKE3 hex (64 chars), `s` = size in bytes.
 /// Field names are deliberately terse — a 10 GB file is ~40 000 of these.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ChunkRef {
+pub struct DeltaChunkRef {
     /// BLAKE3 hash of the chunk (64 hex chars).
     pub h: String,
     /// Chunk size in bytes (1 ..= 1 MiB).
@@ -62,7 +62,7 @@ pub struct ChunkRef {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct DeltaNegotiateRequest {
     /// The file's chunks, in order (duplicates allowed — repeated content).
-    pub chunks: Vec<ChunkRef>,
+    pub chunks: Vec<DeltaChunkRef>,
 }
 
 /// Response of `POST /api/files/delta/negotiate`.
@@ -77,7 +77,7 @@ pub struct DeltaNegotiateResponse {
 /// own hashes to detect corruption before committing.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DeltaChunksResponse {
-    pub received: Vec<ChunkRef>,
+    pub received: Vec<DeltaChunkRef>,
 }
 
 /// Request body of `POST /api/files/delta/commit`.
@@ -89,13 +89,26 @@ pub struct DeltaCommitRequest {
     /// BLAKE3 of the complete file (verified server-side, never trusted).
     pub file_hash: String,
     /// Full chunk sequence, in file order (per occurrence).
-    pub chunks: Vec<ChunkRef>,
+    pub chunks: Vec<DeltaChunkRef>,
     /// Create mode: file name (basename).
     pub name: Option<String>,
     /// Create mode: target folder (caller needs Create permission).
     pub folder_id: Option<String>,
     /// Update mode: file whose content is replaced (caller needs Write).
     pub file_id: Option<String>,
+    /// §9 — the browser's `File.lastModified`, epoch **milliseconds**.
+    ///
+    /// Optional; absent means "stamp `NOW()`". Same unit and trust bounds
+    /// as the multipart `source_modified_at` and the by-hash field: the
+    /// server rounds half-up and refuses implausible values with a 400.
+    ///
+    /// This path needs its own slot because the SPA chooses delta purely
+    /// by size — everything at or above `DELTA_UPLOAD_MIN_SIZE` (8 MiB)
+    /// comes here and never reaches the multipart handler. Without it the
+    /// capability was size-dependent: small uploads kept their mtime and
+    /// large ones silently lost it.
+    #[serde(default)]
+    pub source_modified_at: Option<i64>,
 }
 
 /// Response of `GET /api/files/{id}/manifest` — the recipe to rebuild the
@@ -108,7 +121,7 @@ pub struct DeltaManifestResponse {
     /// Total size in bytes.
     pub total_size: u64,
     /// Full chunk sequence, in file order (per occurrence).
-    pub chunks: Vec<ChunkRef>,
+    pub chunks: Vec<DeltaChunkRef>,
 }
 
 /// Request body of `POST /api/files/delta/download` — distinct chunk
@@ -201,7 +214,7 @@ impl DeltaUploadService {
 
     /// Shape-validate a chunk list: hash format, per-chunk size bounds,
     /// count and total ceilings. Returns the total size.
-    fn validate_chunk_list(&self, chunks: &[ChunkRef]) -> Result<u64, DomainError> {
+    fn validate_chunk_list(&self, chunks: &[DeltaChunkRef]) -> Result<u64, DomainError> {
         if chunks.len() > self.max_chunk_count() {
             return Err(DomainError::validation_error(format!(
                 "Too many chunks: {} (maximum {})",
@@ -263,7 +276,7 @@ impl DeltaUploadService {
         Ok(DeltaChunksResponse {
             received: received
                 .into_iter()
-                .map(|(h, s)| ChunkRef { h, s })
+                .map(|(h, s)| DeltaChunkRef { h, s })
                 .collect(),
         })
     }
@@ -281,6 +294,41 @@ impl DeltaUploadService {
             ));
         }
         let total_size = self.validate_chunk_list(&request.chunks)?;
+
+        // §9 — round the client's milliseconds to seconds, then apply the
+        // same trust bounds every other client-asserted mtime gets. Refuse
+        // rather than clamp, so a wrong client clock is visible to whoever
+        // can fix it instead of being absorbed into stored data.
+        //
+        // Validated here in the service rather than in the handler: this is
+        // where the rest of the commit's input validation already lives, and
+        // a `validation_error` maps to the 400 the handler returns for every
+        // other malformed field.
+        let source_modified_at = match request.source_modified_at {
+            None => None,
+            Some(millis) => {
+                let secs =
+                    crate::application::dtos::timestamp_helpers::millis_to_seconds_rounded(millis);
+                match crate::application::dtos::timestamp_helpers::validate_client_mtime(
+                    secs,
+                    chrono::Utc::now().timestamp(),
+                ) {
+                    Ok(valid) => Some(valid),
+                    Err(rejection) => {
+                        tracing::info!(
+                            target: "audit",
+                            event = "delta_commit.source_mtime_rejected",
+                            reason = rejection.reason(),
+                            asserted_millis = millis,
+                            user_id = %caller_id,
+                            "👮🏻‍♂️ rejected client-asserted source_modified_at on delta commit: {}",
+                            rejection.message(),
+                        );
+                        return Err(DomainError::validation_error(rejection.message()));
+                    }
+                }
+            }
+        };
 
         let mode = match (&request.name, &request.folder_id, &request.file_id) {
             (Some(name), Some(folder_id), None) => {
@@ -363,7 +411,13 @@ impl DeltaUploadService {
                 is_new_blob: false,
             };
             let file = self
-                .register_row(caller_id, &mode, metadata.content_type, blob)
+                .register_row(
+                    caller_id,
+                    &mode,
+                    metadata.content_type,
+                    blob,
+                    source_modified_at,
+                )
                 .await?;
             return Ok(DeltaCommitOutcome::Done {
                 file,
@@ -442,10 +496,10 @@ impl DeltaUploadService {
             CommitMode::Create { name, .. } => name.clone(),
             CommitMode::Update { file_id } => file_id.clone(),
         };
-        let content_type = match refine_content_type(&head, &display_name, "") {
-            ct if ct.is_empty() => "application/octet-stream".to_string(),
-            ct => ct,
-        };
+        // No empty-string guard here any more: `refine_content_type` owns
+        // that fallback, so the one upload path that lacked it is covered
+        // too rather than this one being covered twice.
+        let content_type = refine_content_type(&head, &display_name, "");
         // `request.chunks` is owned and dead after this line (only
         // `request.file_hash` is read below), so move the hashes out instead of
         // cloning each 64-char hash a third time — the distinct set and the
@@ -470,7 +524,13 @@ impl DeltaUploadService {
             is_new_blob: !attached.was_deduplicated(),
         };
         let file = self
-            .register_row(caller_id, &mode, Some(content_type), blob)
+            .register_row(
+                caller_id,
+                &mode,
+                Some(content_type),
+                blob,
+                source_modified_at,
+            )
             .await?;
         Ok(DeltaCommitOutcome::Done {
             file,
@@ -529,7 +589,10 @@ impl DeltaUploadService {
         Ok(DeltaManifestResponse {
             file_hash,
             total_size,
-            chunks: chunks.into_iter().map(|(h, s)| ChunkRef { h, s }).collect(),
+            chunks: chunks
+                .into_iter()
+                .map(|(h, s)| DeltaChunkRef { h, s })
+                .collect(),
         })
     }
 
@@ -640,6 +703,7 @@ impl DeltaUploadService {
         mode: &CommitMode,
         content_type: Option<String>,
         blob: StoredBlob,
+        source_modified_at: Option<i64>,
     ) -> Result<FileDto, DomainError> {
         match mode {
             CommitMode::Create { name, folder_id } => {
@@ -652,12 +716,18 @@ impl DeltaUploadService {
                         content_type,
                         blob,
                         caller_id,
+                        source_modified_at,
                     )
                     .await
             }
             CommitMode::Update { file_id } => {
                 self.uploads
-                    .update_file_content_by_id_with_perms(caller_id, file_id, blob)
+                    .update_file_content_by_id_with_perms(
+                        caller_id,
+                        file_id,
+                        blob,
+                        source_modified_at,
+                    )
                     .await
             }
         }
@@ -686,7 +756,7 @@ fn sanitize_file_name(name: &str) -> Result<String, DomainError> {
 }
 
 /// Distinct hashes in first-occurrence order.
-fn distinct_hashes(chunks: &[ChunkRef]) -> Vec<String> {
+fn distinct_hashes(chunks: &[DeltaChunkRef]) -> Vec<String> {
     // foldhash::quality::RandomState — fast, per-instance random-seeded and thus
     // DoS-safe for these attacker-controlled client hashes (benches/ROUND26.md §G1).
     let mut seen: HashSet<&str, foldhash::quality::RandomState> = HashSet::default();

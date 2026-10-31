@@ -1,9 +1,13 @@
+use crate::application::dtos::display_helpers::ResourceCategory;
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::application::dtos::recent_dto::{RecentCursor, RecentItemDto, RecentResourceRow};
+use crate::application::dtos::favorites_dto::ItemKind;
+use crate::application::dtos::recent_dto::{
+    RecentCursor, RecentItemDto, RecentOrderBy, RecentResourceRow,
+};
 use crate::application::ports::recent_ports::RecentItemsRepositoryPort;
 use crate::common::errors::{DomainError, ErrorKind, Result};
 use crate::domain::services::authorization::ResourceKind;
@@ -65,14 +69,25 @@ impl RecentItemsRepositoryPort for RecentItemsPgRepository {
             )
         })?;
 
-        let items = rows
+        // Mapper returns `Result<_>` so a corrupt `item_type` propagates
+        // out via `?`. The CHECK constraint on `recent_items.item_type`
+        // means this is unreachable in practice.
+        let items: Vec<RecentItemDto> = rows
             .iter()
-            .map(|row| {
-                RecentItemDto {
+            .map(|row| -> Result<RecentItemDto> {
+                let item_type: ItemKind =
+                    row.get::<String, _>("item_type").parse().map_err(|e| {
+                        DomainError::new(
+                            ErrorKind::InternalError,
+                            "RecentItems",
+                            format!("corrupt recent_items.item_type: {e}"),
+                        )
+                    })?;
+                Ok(RecentItemDto {
                     id: row.get::<i32, _>("id").to_string(),
                     user_id: row.get::<Uuid, _>("user_id").to_string(),
                     item_id: row.get("item_id"),
-                    item_type: row.get("item_type"),
+                    item_type,
                     accessed_at: row.get("accessed_at"),
                     item_name: row.try_get("item_name").ok(),
                     item_size: row.try_get("item_size").ok(),
@@ -84,14 +99,11 @@ impl RecentItemsRepositoryPort for RecentItemsPgRepository {
                         .map(|u| u.to_string()),
                     item_path: row.try_get("item_path").ok(),
                     // Temporary defaults; with_display_fields() computes the real values
-                    icon_class: String::new(),
-                    icon_special_class: String::new(),
-                    category: String::new(),
-                    size_formatted: String::new(),
+                    category: ResourceCategory::Unknown,
                 }
-                .with_display_fields()
+                .with_display_fields())
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(items)
     }
@@ -206,7 +218,7 @@ impl RecentItemsRepositoryPort for RecentItemsPgRepository {
         user_id: Uuid,
         limit: usize,
         cursor: Option<&RecentCursor>,
-        order_by: &str,
+        order_by: RecentOrderBy,
         kinds: Option<&[ResourceKind]>,
         reverse: bool,
     ) -> Result<Vec<RecentResourceRow>> {
@@ -240,7 +252,7 @@ impl RecentItemsRepositoryPort for RecentItemsPgRepository {
         NULL::text                       AS mime_type,
         -1::bigint                       AS size,
         fld.created_at                   AS resource_created_at,
-        fld.updated_at                   AS modified_at,
+        fld.content_modified_at,
         fld.drive_id                     AS drive_id,
         NULL::text                       AS blob_hash,
         fld.created_by                   AS created_by,
@@ -284,7 +296,7 @@ impl RecentItemsRepositoryPort for RecentItemsPgRepository {
         f.mime_type,
         f.size::bigint,
         f.created_at                     AS resource_created_at,
-        f.updated_at                     AS modified_at,
+        f.content_modified_at,
         f.drive_id                       AS drive_id,
         f.blob_hash,
         f.created_by                     AS created_by,
@@ -346,7 +358,7 @@ impl RecentItemsRepositoryPort for RecentItemsPgRepository {
         //        $5=cur_id, $6=limit (for "owner" sort: JOIN uses no extra binds)
         let (keyset, order_by_clause, need_user_join) = match (order_by, reverse) {
             // ── name ────────────────────────────────────────────────────────
-            ("name", false) => (
+            (RecentOrderBy::Name, false) => (
                 "WHERE ($3::bigint IS NULL)
                     OR (folder_first::bigint > $3)
                     OR (folder_first::bigint = $3 AND sort_str > $2)
@@ -354,7 +366,7 @@ impl RecentItemsRepositoryPort for RecentItemsPgRepository {
                 "ORDER BY folder_first ASC, sort_str ASC, resource_id ASC",
                 false,
             ),
-            ("name", true) => (
+            (RecentOrderBy::Name, true) => (
                 "WHERE ($3::bigint IS NULL)
                     OR (folder_first::bigint > $3)
                     OR (folder_first::bigint = $3 AND sort_str < $2)
@@ -363,7 +375,7 @@ impl RecentItemsRepositoryPort for RecentItemsPgRepository {
                 false,
             ),
             // ── type ────────────────────────────────────────────────────────
-            ("type", false) => (
+            (RecentOrderBy::Type, false) => (
                 "WHERE ($3::bigint IS NULL)
                     OR (type_order > $3)
                     OR (type_order = $3 AND sort_str > $2)
@@ -371,7 +383,7 @@ impl RecentItemsRepositoryPort for RecentItemsPgRepository {
                 "ORDER BY type_order ASC, sort_str ASC, resource_id ASC",
                 false,
             ),
-            ("type", true) => (
+            (RecentOrderBy::Type, true) => (
                 "WHERE ($3::bigint IS NULL)
                     OR (type_order < $3)
                     OR (type_order = $3 AND sort_str < $2)
@@ -380,14 +392,14 @@ impl RecentItemsRepositoryPort for RecentItemsPgRepository {
                 false,
             ),
             // ── accessed_at ──────────────────────────────────────────────────
-            ("accessed_at", false) => (
+            (RecentOrderBy::AccessedAt, false) => (
                 "WHERE ($4::timestamptz IS NULL)
                     OR (accessed_at < $4)
                     OR (accessed_at = $4 AND resource_id < $5::uuid)",
                 "ORDER BY accessed_at DESC, resource_id DESC",
                 false,
             ),
-            ("accessed_at", true) => (
+            (RecentOrderBy::AccessedAt, true) => (
                 "WHERE ($4::timestamptz IS NULL)
                     OR (accessed_at > $4)
                     OR (accessed_at = $4 AND resource_id > $5::uuid)",
@@ -395,29 +407,29 @@ impl RecentItemsRepositoryPort for RecentItemsPgRepository {
                 false,
             ),
             // ── modified_at ──────────────────────────────────────────────────
-            ("modified_at", false) => (
+            (RecentOrderBy::ModifiedAt, false) => (
                 "WHERE ($4::timestamptz IS NULL)
-                    OR (modified_at < $4)
-                    OR (modified_at = $4 AND resource_id < $5::uuid)",
-                "ORDER BY modified_at DESC, resource_id DESC",
+                    OR (content_modified_at < $4)
+                    OR (content_modified_at = $4 AND resource_id < $5::uuid)",
+                "ORDER BY content_modified_at DESC, resource_id DESC",
                 false,
             ),
-            ("modified_at", true) => (
+            (RecentOrderBy::ModifiedAt, true) => (
                 "WHERE ($4::timestamptz IS NULL)
-                    OR (modified_at > $4)
-                    OR (modified_at = $4 AND resource_id > $5::uuid)",
-                "ORDER BY modified_at ASC, resource_id ASC",
+                    OR (content_modified_at > $4)
+                    OR (content_modified_at = $4 AND resource_id > $5::uuid)",
+                "ORDER BY content_modified_at ASC, resource_id ASC",
                 false,
             ),
             // ── size ─────────────────────────────────────────────────────────
-            ("size", false) => (
+            (RecentOrderBy::Size, false) => (
                 "WHERE ($3::bigint IS NULL)
                     OR (size > $3)
                     OR (size = $3 AND resource_id > $5::uuid)",
                 "ORDER BY size ASC, resource_id ASC",
                 false,
             ),
-            ("size", true) => (
+            (RecentOrderBy::Size, true) => (
                 "WHERE ($3::bigint IS NULL)
                     OR (size < $3)
                     OR (size = $3 AND resource_id < $5::uuid)",
@@ -425,7 +437,7 @@ impl RecentItemsRepositoryPort for RecentItemsPgRepository {
                 false,
             ),
             // ── owner ────────────────────────────────────────────────────────
-            ("owner", false) => (
+            (RecentOrderBy::Owner, false) => (
                 "WHERE ($2::text IS NULL)
                     OR (LOWER(u.username) > $2)
                     OR (LOWER(u.username) = $2 AND accessed_at < $4)
@@ -433,7 +445,7 @@ impl RecentItemsRepositoryPort for RecentItemsPgRepository {
                 "ORDER BY LOWER(u.username) ASC, accessed_at DESC, resource_id DESC",
                 true,
             ),
-            ("owner", true) => (
+            (RecentOrderBy::Owner, true) => (
                 "WHERE ($2::text IS NULL)
                     OR (LOWER(u.username) < $2)
                     OR (LOWER(u.username) = $2 AND accessed_at > $4)
@@ -441,21 +453,10 @@ impl RecentItemsRepositoryPort for RecentItemsPgRepository {
                 "ORDER BY LOWER(u.username) DESC, accessed_at ASC, resource_id ASC",
                 true,
             ),
-            // ── default: accessed_at DESC ─────────────────────────────────────
-            (_, false) => (
-                "WHERE ($4::timestamptz IS NULL)
-                    OR (accessed_at < $4)
-                    OR (accessed_at = $4 AND resource_id < $5::uuid)",
-                "ORDER BY accessed_at DESC, resource_id DESC",
-                false,
-            ),
-            (_, true) => (
-                "WHERE ($4::timestamptz IS NULL)
-                    OR (accessed_at > $4)
-                    OR (accessed_at = $4 AND resource_id > $5::uuid)",
-                "ORDER BY accessed_at ASC, resource_id ASC",
-                false,
-            ),
+            // §7: no catch-all — all six `RecentOrderBy` variants are
+            // named above, so this match is exhaustive and a new axis is a
+            // compile error rather than silently ordering by accessed_at
+            // while the caller's cursor carries a different axis.
         };
 
         let user_join = if need_user_join {
@@ -477,7 +478,7 @@ impl RecentItemsRepositoryPort for RecentItemsPgRepository {
             "{cte}
 SELECT
     r.resource_type, r.resource_id, r.name, r.parent_id,
-    r.mime_type, r.size, r.resource_created_at, r.modified_at,
+    r.mime_type, r.size, r.resource_created_at, r.content_modified_at,
     r.drive_id, r.blob_hash, r.created_by, r.updated_by,
     r.is_favorite, r.is_shared,
     r.is_owner, r.accessed_at, r.resource_path,
@@ -518,31 +519,26 @@ LIMIT $6"
 
                 // Pre-compute the cursor sort fields based on order_by
                 let (c_sort_str, c_sort_int, c_sort_ts) = match order_by {
-                    "name" => (sort_str_val, Some(folder_first as i64), None),
-                    "type" => (sort_str_val, Some(type_order), None),
-                    "size" => (None, Some(size), None),
-                    "accessed_at" => {
+                    RecentOrderBy::Name => (sort_str_val, Some(folder_first as i64), None),
+                    RecentOrderBy::Type => (sort_str_val, Some(type_order), None),
+                    RecentOrderBy::Size => (None, Some(size), None),
+                    RecentOrderBy::AccessedAt => {
                         let ts: Option<chrono::DateTime<chrono::Utc>> =
                             row.try_get("accessed_at").ok();
                         (None, None, ts)
                     }
-                    "modified_at" => {
+                    RecentOrderBy::ModifiedAt => {
                         let ts: Option<chrono::DateTime<chrono::Utc>> =
-                            row.try_get("modified_at").ok();
+                            row.try_get("content_modified_at").ok();
                         (None, None, ts)
                     }
-                    "owner" => {
+                    RecentOrderBy::Owner => {
                         // For "owner" sort the JOIN added LOWER(u.username) AS username_lower.
                         // The cursor's sort_str must carry the username (not the file name).
                         let username: Option<String> = row.try_get("username_lower").ok();
                         let ts: Option<chrono::DateTime<chrono::Utc>> =
                             row.try_get("accessed_at").ok();
                         (username, None, ts)
-                    }
-                    _ => {
-                        let ts: Option<chrono::DateTime<chrono::Utc>> =
-                            row.try_get("accessed_at").ok();
-                        (None, None, ts)
                     }
                 };
 
@@ -554,7 +550,7 @@ LIMIT $6"
                     mime_type: row.try_get("mime_type").ok(),
                     size,
                     resource_created_at: row.get("resource_created_at"),
-                    modified_at: row.get("modified_at"),
+                    modified_at: row.get("content_modified_at"),
                     drive_id: row.get("drive_id"),
                     blob_hash: row.try_get("blob_hash").ok(),
                     created_by: row.try_get("created_by").ok(),

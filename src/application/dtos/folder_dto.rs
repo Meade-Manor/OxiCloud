@@ -1,7 +1,5 @@
-use std::sync::Arc;
-
 use crate::application::dtos::cursor::{CursorListResponse, CursorQuery, PageCursor};
-use crate::application::dtos::display_helpers::intern_display;
+use crate::application::dtos::display_helpers::ResourceCategory;
 use crate::application::dtos::grant_dto::{
     GrantDto, ResourceContentDto, ResourceDto, ResourceTypeDto, RoleDto,
 };
@@ -64,23 +62,28 @@ pub struct FolderDto {
     pub created_at: DateTime<Utc>,
 
     /// Last modification timestamp (RFC 3339 UTC).
+    ///
+    /// The folder row's own `updated_at` — bumped by a rename or a move of
+    /// *this* folder, not by anything happening inside it. For "did anything
+    /// in this subtree change", use `tree_modified_at` below.
     pub modified_at: DateTime<Utc>,
 
-    /// Whether this is a root folder
-    pub is_root: bool,
+    /// Descendant-rollup timestamp (RFC 3339 UTC): the most recent change
+    /// anywhere in this folder's subtree.
+    ///
+    /// This is what a collection's content-modification time actually means —
+    /// a folder's "content" is its children — so `D:getlastmodified` is
+    /// sourced from here rather than from `modified_at`, which would report a
+    /// rename of the folder itself as a content change. It is also the input
+    /// to `etag` below, so the two agree by construction.
+    ///
+    /// See `docs/architecture/dates.md` § Collections.
+    pub tree_modified_at: DateTime<Utc>,
 
     // ── Pre-computed display fields (Arc<str>: always identical values) ──
-    /// FontAwesome icon CSS class (always "fas fa-folder")
-    #[schema(value_type = String)]
-    pub icon_class: Arc<str>,
-
-    /// Extra CSS class for icon styling (always "folder-icon")
-    #[schema(value_type = String)]
-    pub icon_special_class: Arc<str>,
-
-    /// Human-readable category (always "Folder")
-    #[schema(value_type = String)]
-    pub category: Arc<str>,
+    /// Content category — a stable machine key, not display text; always
+    /// "Folder". See `FileDto::category` for the contract.
+    pub category: ResourceCategory,
 
     /// Opaque ETag for HTTP responses. Populated from `Folder::etag()`
     /// at conversion time so every WebDAV / NextCloud handler emits
@@ -120,7 +123,6 @@ impl From<Folder> for FolderDto {
         // for id, name, path, parent_id (previously 3-4× .to_string()).
         let parts = folder.into_parts();
 
-        let is_root = parts.parent_id.is_none();
         // Single-allocation ETag straight from the owned parts. The old
         // shape (`folder.etag().to_string()`) built the String and then
         // cloned it — a pure double-alloc.
@@ -137,12 +139,10 @@ impl From<Folder> for FolderDto {
             // the DTO boundary. See `timestamp_helpers` for the rationale.
             created_at: epoch_to_datetime(parts.created_at),
             modified_at: epoch_to_datetime(parts.modified_at),
-            is_root,
-            // Constant display fields: refcount bump on interned statics
-            // instead of 3 fresh Arc allocations per row.
-            icon_class: intern_display("fas fa-folder"),
-            icon_special_class: intern_display("folder-icon"),
-            category: intern_display("Folder"),
+            tree_modified_at: epoch_to_datetime(parts.tree_modified_at),
+            // Constant display field: refcount bump on an interned static
+            // instead of a fresh Arc allocation per row.
+            category: ResourceCategory::Folder,
             etag,
             created_by: parts.created_by,
             updated_by: parts.updated_by,
@@ -158,8 +158,8 @@ impl From<Folder> for FolderDto {
 // To convert from FolderDto to Folder for batch handlers
 impl From<FolderDto> for Folder {
     fn from(dto: FolderDto) -> Self {
-        // Display fields (icon_class, icon_special_class, category)
-        // are not part of the domain entity and are ignored.
+        // `category` is a display field, not part of the domain entity,
+        // and is ignored.
         Folder::from_dto(
             dto.id,
             dto.name,
@@ -222,10 +222,8 @@ impl FolderDto {
             drive_id: Uuid::nil(),
             created_at: epoch_zero(),
             modified_at: epoch_zero(),
-            is_root: true,
-            icon_class: intern_display("fas fa-folder"),
-            icon_special_class: intern_display("folder-icon"),
-            category: intern_display("Folder"),
+            tree_modified_at: epoch_zero(),
+            category: ResourceCategory::Folder,
             etag: String::new(),
             created_by: None,
             updated_by: None,
@@ -297,15 +295,54 @@ pub struct FolderResourceRow {
     pub folder_first: i32,
 }
 
+/// Sort axis for `GET /api/folders/{id}/resources` (§7).
+///
+/// Typed rather than `Option<String>` so an unknown axis is refused at
+/// wire-decode time instead of silently falling back to the default. See
+/// [`crate::application::dtos::trash_dto::TrashOrderBy`] for why these are
+/// per-endpoint enums rather than one shared union.
+///
+/// This is the folder-contents listing — the hot path behind `/files` —
+/// and the endpoint where §2 found a keyset predicate reading one column
+/// while the ORDER BY named another. Typing the axis is what stops the
+/// query builder and the cursor builder disagreeing about it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FolderOrderBy {
+    /// Default — alphabetical with folders before files (`folder_first`),
+    /// which is what a file browser is expected to do.
+    #[default]
+    Name,
+    /// Grouped by category (`category_order`: Folder, Image, …) then
+    /// alphabetical within a category.
+    Type,
+    /// The item's content clock (`content_modified_at`) — §2 repointed
+    /// this off `updated_at`, so a rename or move no longer resurfaces a
+    /// row; only a real content change does.
+    ModifiedAt,
+    /// When the row was created on this server (immutable).
+    CreatedAt,
+    /// By byte size. Folders carry a `-1` sentinel so they cluster
+    /// together rather than interleaving at zero.
+    Size,
+}
+
 /// Opaque keyset-pagination cursor for `/api/folders/{id}/resources`.
 ///
 /// Encoded as base64url-JSON (same scheme as [`GrantCursor`]).
 /// Fields are sparse: only the sort-relevant ones are serialised.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderResourceCursor {
-    /// Sort dimension active when this cursor was produced.
-    #[serde(default = "FolderResourceCursor::default_order")]
-    pub order_by: String,
+    /// Sort dimension active when this cursor was produced. Typed so the
+    /// cursor's axis and the query's axis are one type and cannot drift —
+    /// the keyset predicate and the ORDER BY must name the same column or
+    /// pagination skips or repeats rows. This endpoint is where §2 found
+    /// that hazard, so the type matters more here than anywhere else.
+    ///
+    /// Wire-compatible with the previous `String` form: snake_case
+    /// serialises to the identical token, so existing cursors decode.
+    #[serde(default)]
+    pub order_by: FolderOrderBy,
     /// UUID of the last item on the previous page (tie-breaker).
     pub resource_id: Uuid,
     /// `LOWER(name)` for `name`/`type` sorts.
@@ -324,12 +361,6 @@ pub struct FolderResourceCursor {
     /// Must be passed unchanged on subsequent page requests.
     #[serde(default)]
     pub reverse: bool,
-}
-
-impl FolderResourceCursor {
-    fn default_order() -> String {
-        "name".to_owned()
-    }
 }
 
 impl PageCursor for FolderResourceCursor {}
@@ -362,9 +393,10 @@ pub struct FolderResourcesQuery {
     pub limit: u32,
     /// Opaque cursor from a previous response. Omit to start from the top.
     pub cursor: Option<String>,
-    /// Sort / group-by dimension. Supported: `"name"` (default), `"type"`,
-    /// `"modified_at"`, `"created_at"`, `"size"`.
-    pub order_by: Option<String>,
+    /// Sort / group-by dimension — see [`FolderOrderBy`]. Omit for
+    /// `name`. An unknown value is a 400 naming the accepted set, not a
+    /// silent fall back to the default.
+    pub order_by: Option<FolderOrderBy>,
     /// Comma-separated resource types to include, e.g. `"file,folder"`.
     /// Omit to include both.
     pub resource_types: Option<String>,
@@ -406,7 +438,7 @@ impl FolderResourcesQuery {
 pub struct ListResourcesOptions<'a> {
     pub limit: usize,
     pub cursor: Option<FolderResourceCursor>,
-    pub order_by: &'a str,
+    pub order_by: FolderOrderBy,
     pub kinds: Option<&'a [ResourceKind]>,
     pub reverse: bool,
 }

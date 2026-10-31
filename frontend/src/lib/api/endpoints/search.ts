@@ -1,11 +1,21 @@
 // Search endpoint — hits the normalized `/*/resources` envelope shape.
 import { apiFetch, apiJson } from '$lib/api/client';
-import type { ItemType, SearchResourcesResponse, SortBy } from '$lib/api/types';
+import type { ItemType, SearchResourcesResponse } from '$lib/api/types';
+import type { SearchOrderBy, SearchTypeFilter } from '$lib/api/generated/openapi/types.gen';
 
 export interface SearchOptions {
 	folderId?: string;
 	recursive?: boolean;
-	fileTypes?: string[];
+	/**
+	 * One resource category, typed off the generated `SearchTypeFilter` union.
+	 *
+	 * Replaced `fileTypes?: string[]`, which shipped a hardcoded extension
+	 * list per category from this SPA — so a format we forgot to list
+	 * (`.jfif`, `.m4b`) silently vanished from its own category, and a file
+	 * with no extension could never match anything. The server now owns the
+	 * classification, keyed on the indexed `storage.files.category_order`.
+	 */
+	typeFilter?: SearchTypeFilter;
 	minSize?: number;
 	maxSize?: number;
 	/** Unix-seconds lower bound on created time. */
@@ -24,7 +34,7 @@ export interface SearchOptions {
 	 */
 	cursor?: string;
 	/** Sort dimension; maps to backend `order_by`. */
-	sortBy?: SortBy;
+	sortBy?: SearchOrderBy;
 	/** Reverse sort direction; maps to backend `reverse`. */
 	reverse?: boolean;
 	/** Restrict to files, folders, or both (default). */
@@ -47,9 +57,9 @@ export function searchResources(
 	params.append('query', query);
 	if (opts.folderId) params.append('folder_id', opts.folderId);
 	if (opts.recursive !== undefined) params.append('recursive', String(opts.recursive));
-	// The backend expects a single comma-separated `type` param (it splits on
-	// ','); appending one param per type yields a "duplicate field" 400.
-	if (opts.fileTypes?.length) params.append('type', opts.fileTypes.join(','));
+	// One typed token, not a list: `all` is the server's default so it is
+	// omitted rather than sent.
+	if (opts.typeFilter && opts.typeFilter !== 'all') params.append('type', opts.typeFilter);
 	if (opts.minSize != null) params.append('min_size', String(opts.minSize));
 	if (opts.maxSize != null) params.append('max_size', String(opts.maxSize));
 	if (opts.createdAfter != null) params.append('created_after', String(opts.createdAfter));

@@ -3,14 +3,12 @@ use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::application::dtos::cursor::PageCursor;
-use crate::application::dtos::display_helpers::{
-    classify_display, format_file_size, intern_display, intern_mime,
-};
+use crate::application::dtos::display_helpers::{ResourceCategory, category_for, intern_mime};
 use crate::application::dtos::file_dto::FileDto;
 use crate::application::dtos::folder_dto::FolderDto;
 use crate::application::dtos::grant_dto::{ResourceContentDto, ResourceTypeDto};
 use crate::application::dtos::trash_dto::{
-    TrashCursor, TrashResourceItemDto, TrashResourceRow, TrashedItemDto,
+    TrashCursor, TrashOrderBy, TrashResourceItemDto, TrashResourceRow, TrashedItemDto,
 };
 use crate::application::ports::authorization_ports::AuthorizationEngine;
 use crate::application::ports::file_lifecycle::FileLifecycleHook;
@@ -128,24 +126,12 @@ impl TrashService {
         // Calculate days_until_deletion before moving item fields
         let days_until_deletion = item.days_until_deletion();
 
-        // Determine display fields based on item type
-        let (category, icon_class, icon_special_class) = match item.item_type() {
-            TrashedItemType::Folder => (
-                "Folder".to_string(),
-                "fas fa-folder".to_string(),
-                "folder-icon".to_string(),
-            ),
-            TrashedItemType::File => {
-                // Use empty MIME type to leverage extension fallback; one
-                // fused pass lowers the extension once instead of three
-                // times (benches/ROUND11.md §21).
-                let classes = classify_display(item.name(), "");
-                (
-                    classes.category.to_string(),
-                    classes.icon_class.to_string(),
-                    classes.icon_special_class.to_string(),
-                )
-            }
+        // Determine the display field based on item type
+        let category = match item.item_type() {
+            TrashedItemType::Folder => ResourceCategory::Folder,
+            // Empty MIME type, so the classifier falls through to the
+            // extension arms — trash rows carry no stored mime.
+            TrashedItemType::File => category_for(item.name(), ""),
         };
 
         // Move the owned Strings out of the consumed item — the getter
@@ -163,8 +149,6 @@ impl TrashService {
             trashed_at: parts.trashed_at,
             days_until_deletion,
             category,
-            icon_class,
-            icon_special_class,
         }
     }
 }
@@ -887,7 +871,7 @@ impl TrashService {
         user_id: Uuid,
         limit: usize,
         cursor: Option<TrashCursor>,
-        order_by: &str,
+        order_by: TrashOrderBy,
         kinds: Option<&[ResourceKind]>,
         reverse: bool,
     ) -> Result<(Vec<TrashResourceItemDto>, Option<String>)> {
@@ -935,13 +919,18 @@ impl TrashService {
 
 /// Build the next-page cursor from the last row of the current page.
 /// `reverse` is stored in the cursor so subsequent pages use the same direction.
-fn build_trash_cursor(row: &TrashResourceRow, order_by: &str, reverse: bool) -> TrashCursor {
-    let order_by_owned = match order_by {
-        "deletion_date" | "trashed_at" | "name" | "type" | "size" => order_by.to_owned(),
-        _ => "deletion_date".to_owned(),
-    };
+fn build_trash_cursor(
+    row: &TrashResourceRow,
+    order_by: TrashOrderBy,
+    reverse: bool,
+) -> TrashCursor {
+    // §7: no sanitising arm here any more. This used to re-validate the
+    // axis and silently rewrite anything unrecognised to "expires_at",
+    // which meant a bad value produced a 200 with the wrong order. The
+    // type now makes an invalid axis unrepresentable, so the check it was
+    // performing cannot fail.
     TrashCursor {
-        order_by: order_by_owned,
+        order_by,
         resource_id: row.resource_id,
         sort_str: row.sort_str.clone(),
         sort_int: row.sort_int,
@@ -970,10 +959,11 @@ fn row_to_item_dto(row: TrashResourceRow) -> TrashResourceItemDto {
             drive_id: row.drive_id,
             created_at: row.resource_created_at,
             modified_at: row.modified_at,
-            is_root: false,
-            icon_class: intern_display("fas fa-folder"),
-            icon_special_class: intern_display("folder-icon"),
-            category: intern_display("Folder"),
+            // The trash listing carries no subtree rollup, and trashed
+            // folders are never reachable over DAV, so the row's own mtime
+            // stands in rather than a claim about descendants.
+            tree_modified_at: row.modified_at,
+            category: ResourceCategory::Folder,
             created_by: row.created_by,
             updated_by: row.updated_by,
             is_favorite: row.is_favorite,
@@ -982,7 +972,7 @@ fn row_to_item_dto(row: TrashResourceRow) -> TrashResourceItemDto {
         TrashResourceItemDto {
             resource_type: ResourceTypeDto::Folder,
             trashed_at: row.trashed_at,
-            deletion_date: row.deletion_date,
+            expires_at: row.expires_at,
             drive_id: row.drive_id,
             resource: ResourceContentDto::Folder(dto),
         }
@@ -997,7 +987,8 @@ fn row_to_item_dto(row: TrashResourceRow) -> TrashResourceItemDto {
         // may conditional-request it immediately after.
         let etag = File::etag_for_listing(row.blob_hash.as_deref(), row.modified_at);
         let content_hash = row.blob_hash.unwrap_or_default();
-        let classes = classify_display(&row.name, mime);
+        // Compute before the literal moves `row.name` out.
+        let category = category_for(&row.name, mime);
         let dto = FileDto {
             id: row.resource_id.to_string(),
             name: row.name,
@@ -1007,10 +998,7 @@ fn row_to_item_dto(row: TrashResourceRow) -> TrashResourceItemDto {
             folder_id: row.parent_id.map(|u| u.to_string()),
             created_at: row.resource_created_at,
             modified_at: row.modified_at,
-            icon_class: intern_display(classes.icon_class),
-            icon_special_class: intern_display(classes.icon_special_class),
-            category: intern_display(classes.category),
-            size_formatted: format_file_size(size_bytes),
+            category,
             content_hash,
             etag,
             created_by: row.created_by,
@@ -1021,7 +1009,7 @@ fn row_to_item_dto(row: TrashResourceRow) -> TrashResourceItemDto {
         TrashResourceItemDto {
             resource_type: ResourceTypeDto::File,
             trashed_at: row.trashed_at,
-            deletion_date: row.deletion_date,
+            expires_at: row.expires_at,
             drive_id: row.drive_id,
             resource: ResourceContentDto::File(dto),
         }
