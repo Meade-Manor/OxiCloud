@@ -23,7 +23,7 @@
 
 import log from 'loglevel';
 
-import { fetchServerConfig } from '$lib/api/endpoints/config';
+import { getConfig } from '$lib/api/generated/openapi/sdk.gen';
 import type { ServerAuth, ServerConfig, ServerFeatures, ServerStatus } from '$lib/api/types';
 
 /** Sensible defaults for every field. Used before `load()` resolves
@@ -41,7 +41,14 @@ const DEFAULT_FEATURES: ServerFeatures = {
 	faces: false,
 	video_thumbnails: true,
 	external_mounts: false,
-	markdown_collab: false
+	markdown_collab: false,
+	// Shared-worker bus — on by default (opt-out). The flag gates FE
+	// behaviour only; a client that can't reach the server to read it
+	// should default to the same mode the server would advertise.
+	// Browsers that can't actually run shared mode still fall back to
+	// per-tab via `trySharedWorker` detection — the flag never bypasses
+	// capability checks.
+	shared_worker_bus: true
 };
 
 const DEFAULT_STATUS: ServerStatus = {
@@ -86,7 +93,12 @@ class ServerConfigStore {
 
 	async load(): Promise<void> {
 		try {
-			const cfg: ServerConfig = await fetchServerConfig();
+			// `{ throwOnError: true }` narrows the generated return type
+			// from `ServerConfigDto | undefined` to `ServerConfigDto` and
+			// turns a non-2xx into a thrown exception — matching the
+			// semantics of the previous `apiJson<ServerConfig>` wrapper
+			// exactly. See `docs/plan/move-to-openapi.md` for the pattern.
+			const cfg: ServerConfig = await getConfig({ throwOnError: true });
 			this.version = cfg.version;
 			this.features = cfg.features;
 			this.auth = cfg.auth ?? { ...DEFAULT_AUTH };
@@ -98,7 +110,12 @@ class ServerConfigStore {
 			// `banners_version` so the first header carrying the same
 			// version doesn't trigger a redundant refetch.
 			const { hydrateBanners } = await import('$lib/stores/serverStatus.svelte');
-			hydrateBanners(cfg.server_status.banners, cfg.server_status.banners_version);
+			// Null-coalesce at the SDK/store boundary — see the sibling
+			// `serverStatus.svelte.ts` note for the full rationale.
+			hydrateBanners(
+				cfg.server_status.banners ?? undefined,
+				cfg.server_status.banners_version ?? undefined
+			);
 			cfgLog.debug('server config loaded', {
 				version: cfg.version,
 				message_bus: cfg.features.message_bus,

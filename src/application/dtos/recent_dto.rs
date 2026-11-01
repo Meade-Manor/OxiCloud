@@ -1,10 +1,12 @@
+use crate::application::dtos::display_helpers::ResourceCategory;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use super::cursor::{CursorListResponse, CursorQuery, PageCursor};
-use super::display_helpers::{classify_display, format_file_size};
+use super::display_helpers::category_for;
+use super::favorites_dto::ItemKind;
 use super::grant_dto::{ResourceContentDto, ResourceTypeDto};
 use crate::domain::services::authorization::ResourceKind;
 
@@ -21,8 +23,10 @@ pub struct RecentItemDto {
     /// Item ID (file or folder)
     pub item_id: String,
 
-    /// Item type ('file' or 'folder')
-    pub item_type: String,
+    /// Item type. Shared enum with `FavoriteItemDto.item_type` — both
+    /// collections record a reference to one of the two leaf resource
+    /// kinds, nothing else.
+    pub item_type: ItemKind,
 
     /// When the item was accessed
     pub accessed_at: DateTime<Utc>,
@@ -49,40 +53,25 @@ pub struct RecentItemDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item_path: Option<String>,
 
-    // ── Pre-computed display fields ──
-    /// FontAwesome icon CSS class (e.g. "fas fa-file-image", "fas fa-folder")
-    pub icon_class: String,
-
-    /// Extra CSS class for icon styling (e.g. "image-icon", "folder-icon")
-    pub icon_special_class: String,
-
-    /// Human-readable category (e.g. "Image", "Folder")
-    pub category: String,
-
-    /// Formatted file size (e.g. "3.27 MB"); "--" for folders
-    pub size_formatted: String,
+    // ── Pre-computed display field ──
+    /// Content category — a stable machine key, not display text (e.g.
+    /// "Image", "Folder"). See `FileDto::category`.
+    pub category: ResourceCategory,
 }
 
 impl RecentItemDto {
-    /// Populate display fields from the enriched metadata.
+    /// Populate the display field from the enriched metadata.
     /// Call this after constructing from the SQL row.
     pub fn with_display_fields(mut self) -> Self {
-        if self.item_type == "folder" {
-            self.icon_class = "fas fa-folder".to_string();
-            self.icon_special_class = "folder-icon".to_string();
-            self.category = "Folder".to_string();
-            self.size_formatted = "--".to_string();
+        if matches!(self.item_type, ItemKind::Folder) {
+            self.category = ResourceCategory::Folder;
         } else {
             let name = self.item_name.as_deref().unwrap_or("");
             let mime = self
                 .item_mime_type
                 .as_deref()
                 .unwrap_or("application/octet-stream");
-            let classes = classify_display(name, mime);
-            self.icon_class = classes.icon_class.to_string();
-            self.icon_special_class = classes.icon_special_class.to_string();
-            self.category = classes.category.to_string();
-            self.size_formatted = format_file_size(self.item_size.unwrap_or(0) as u64);
+            self.category = category_for(name, mime);
         }
         self
     }
@@ -142,13 +131,46 @@ pub struct RecentResourceRow {
     pub sort_ts: Option<DateTime<Utc>>,
 }
 
+/// Sort axis for `GET /api/recent/resources` (§7).
+///
+/// Typed rather than `Option<String>` so an unknown axis is refused at
+/// wire-decode time instead of silently falling back to the default. See
+/// [`crate::application::dtos::trash_dto::TrashOrderBy`] for why these are
+/// per-endpoint enums: `accessed_at` is recent's own date axis and means
+/// nothing on any other listing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RecentOrderBy {
+    /// Default — when the caller last opened it, most recent first. The
+    /// whole point of the endpoint, so it leads.
+    #[default]
+    AccessedAt,
+    /// Alphabetical, folders before files (`folder_first`).
+    Name,
+    /// Grouped by kind, then alphabetical within a kind.
+    Type,
+    /// The item's content clock (`content_modified_at`) — a rename or
+    /// move does not resurface a row, only a real content change.
+    ModifiedAt,
+    /// By byte size. Folders carry a sentinel so they cluster.
+    Size,
+    /// By owner display name — recents span drives, so this groups a
+    /// mixed list by who owns each item.
+    Owner,
+}
+
 /// Opaque keyset-pagination cursor for `GET /api/recent/resources`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecentCursor {
-    /// Sort dimension active when this cursor was produced.
-    /// Values: `"accessed_at"` (default), `"name"`, `"type"`, `"modified_at"`, `"size"`, `"owner"`.
-    #[serde(default = "RecentCursor::default_order")]
-    pub order_by: String,
+    /// Sort dimension active when this cursor was produced. Typed so the
+    /// cursor's axis and the query's axis are one type and cannot drift —
+    /// the keyset predicate and the ORDER BY must name the same column or
+    /// pagination skips or repeats rows.
+    ///
+    /// Wire-compatible with the previous `String` form: snake_case
+    /// serialises to the identical token, so existing cursors decode.
+    #[serde(default)]
+    pub order_by: RecentOrderBy,
     /// UUID of the last item on the previous page (tie-breaker).
     pub resource_id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,12 +183,6 @@ pub struct RecentCursor {
     pub reverse: bool,
 }
 
-impl RecentCursor {
-    fn default_order() -> String {
-        "accessed_at".to_owned()
-    }
-}
-
 impl PageCursor for RecentCursor {}
 
 /// Query parameters for `GET /api/recent/resources`.
@@ -177,9 +193,10 @@ pub struct RecentResourcesQuery {
     pub limit: u32,
     /// Opaque cursor from a previous response. Omit to start from the first page.
     pub cursor: Option<String>,
-    /// Sort / group-by dimension. Supported: `"accessed_at"` (default), `"name"`,
-    /// `"type"`, `"modified_at"`, `"size"`, `"owner"`.
-    pub order_by: Option<String>,
+    /// Sort / group-by dimension — see [`RecentOrderBy`]. Omit for
+    /// `accessed_at`. An unknown value is a 400 naming the accepted set,
+    /// not a silent fall back to the default.
+    pub order_by: Option<RecentOrderBy>,
     /// Comma-separated resource types to include, e.g. `"file,folder"`.
     /// Omit to include both.
     pub resource_types: Option<String>,

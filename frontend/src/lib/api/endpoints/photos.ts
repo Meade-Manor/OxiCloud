@@ -2,6 +2,7 @@
 import { apiFetch } from '$lib/api/client';
 import { getCsrfHeaders } from '$lib/api/csrf';
 import type { FileItem } from '$lib/api/types';
+import type { PhotoOrderBy, PhotoResourceItemDto } from '$lib/api/generated/openapi/types.gen';
 
 /**
  * A timeline photo/video. The `/api/photos/resources` envelope carries file
@@ -16,10 +17,14 @@ import type { FileItem } from '$lib/api/types';
 export interface PhotoItem extends FileItem {
 	width?: number;
 	height?: number;
-	/** Always present on the envelope — epoch seconds; the item's sort axis value. */
-	sort_date: number;
-	/** Raw EXIF `DateTimeOriginal`, epoch seconds. Absent when the file carries no EXIF date. */
-	captured_at?: number;
+	/**
+	 * Always present on the envelope: the value of the ACTIVE sort axis,
+	 * RFC 3339 UTC. Group and bucket on THIS field — it tracks the
+	 * ordering, and grouping on any other date can reopen a closed month.
+	 */
+	sort_date: string;
+	/** Raw EXIF `DateTimeOriginal` (RFC 3339 UTC). Absent when the file carries no EXIF date. */
+	captured_at?: string;
 	/** Raw EXIF orientation (TIFF 1-8). Absent when the file carries no orientation tag. */
 	orientation?: number;
 	/** `true` when the file has both lat AND lng. Raw coordinates stay off the listing. */
@@ -42,18 +47,31 @@ export interface PhotoPage {
 	nextCursor: string | null;
 }
 
-/** One row of the `/api/photos/resources` envelope — item-level fields + nested `resource`. */
-interface PhotoEnvelopeItem {
+/**
+ * One row of the `/api/photos/resources` envelope — item-level fields plus the
+ * nested `resource`.
+ *
+ * **Derived from the generated SDK type, not hand-written.** Every field except
+ * `resource` comes from `PhotoResourceItemDto`, so a server-side change to
+ * `sort_date`, `captured_at`, `width`, … breaks this build instead of silently
+ * mismatching at runtime. That guard did not exist before: the DTO was absent
+ * from the OpenAPI spec entirely, so there was no generated twin to check
+ * against, which is how `captured_at` stayed typed `number` long after the
+ * server began sending RFC 3339.
+ *
+ * `resource` is narrowed from the generated `ResourceContentDto` (an untagged
+ * `FileDto | FolderDto | DriveDto`) to `FileItem`, because this endpoint only
+ * ever returns files — `resource_type` is always `'file'`. Keeping the union
+ * would force a cast at every flatten site for no gain.
+ *
+ * Note `check-types-overlap.mjs` cannot catch this class of drift: it compares
+ * NAMES, and `PhotoEnvelopeItem` never collided with `PhotoResourceItemDto`.
+ * Deriving the type is the structural fix that script's own docs recommend.
+ */
+type PhotoEnvelopeItem = Omit<PhotoResourceItemDto, 'resource' | 'resource_type'> & {
 	resource_type: 'file';
 	resource: FileItem;
-	width?: number;
-	height?: number;
-	sort_date: number;
-	captured_at?: number;
-	orientation?: number;
-	has_gps: boolean;
-	has_blob_siblings: boolean;
-}
+};
 
 interface PhotosEnvelope {
 	items: PhotoEnvelopeItem[];
@@ -64,7 +82,7 @@ interface PhotosEnvelope {
 /** EXIF metadata returned by `/api/files/{id}/metadata` (subset used by the lightbox). */
 export interface FileMetadata {
 	file_id: string;
-	captured_at?: number;
+	captured_at?: string;
 	latitude?: number | null;
 	longitude?: number | null;
 	camera_make?: string | null;
@@ -112,10 +130,15 @@ const BATCH_CHUNK_SIZE = 1000;
  *  short on the default view. */
 export type PhotosKind = 'all' | 'photo' | 'video';
 
-/** Sort axis on the Photos timeline (§3). `captured_at` (default) orders by
- *  EXIF capture date with upload-time fallback; `created_at` is pure upload
- *  time; `updated_at` surfaces recently-touched rows. */
-export type PhotosOrderBy = 'captured_at' | 'created_at' | 'updated_at';
+// §7 part 3g: the hand-written `PhotosOrderBy` union lived here and was
+// character-for-character the generated `PhotoOrderBy`. DELETED rather
+// than aliased — one concept, one name — so this module and its route
+// import the SDK type directly.
+//
+// The axis semantics now live on the Rust enum's doc comment, which
+// utoipa carries into the schema: `captured_at` (default) orders by
+// `COALESCE(captured_at, content_modified_at)`, `created_at` is pure
+// arrival time, `modified_at` is the content clock.
 
 /** Optional filter / cursor knobs on {@link fetchPhotos}. All default
  *  to "no filter"; the resulting URL omits every absent param. */
@@ -129,7 +152,7 @@ export interface FetchPhotosOptions {
 	/** Narrow to the caller's favourited rows only. `false`/omitted keeps the full feed. */
 	favoriteOnly?: boolean;
 	/** Sort axis (§3). Default `captured_at`; absent query param on default. */
-	orderBy?: PhotosOrderBy;
+	orderBy?: PhotoOrderBy;
 	/** Flip to oldest-first on whichever axis `orderBy` selects. */
 	reverse?: boolean;
 }
@@ -167,13 +190,20 @@ export async function fetchPhotos(limit = 60, opts: FetchPhotosOptions = {}): Pr
 	const res = await apiFetch(`/api/photos/resources?${q}`, { credentials: 'same-origin' });
 	if (!res.ok) throw new Error(`photos failed: ${res.status}`);
 	const envelope = (await res.json()) as PhotosEnvelope;
+	// `?? undefined` on the optionals is a null→absent normalisation, not
+	// defensive noise. The server marks these `skip_serializing_if =
+	// "Option::is_none"`, so the wire omits them and never sends null — but
+	// utoipa renders `Option<T>` as `[T, null]`, so the generated type says
+	// `| null`. Collapsing it here keeps `PhotoItem` (the FE-internal
+	// flattened shape) honest about the real contract instead of propagating
+	// a generator artifact into every consumer.
 	const items: PhotoItem[] = (envelope.items ?? []).map((row) => ({
 		...row.resource,
-		width: row.width,
-		height: row.height,
+		width: row.width ?? undefined,
+		height: row.height ?? undefined,
 		sort_date: row.sort_date,
-		captured_at: row.captured_at,
-		orientation: row.orientation,
+		captured_at: row.captured_at ?? undefined,
+		orientation: row.orientation ?? undefined,
 		has_gps: row.has_gps,
 		has_blob_siblings: row.has_blob_siblings
 	}));

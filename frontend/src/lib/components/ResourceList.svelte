@@ -6,7 +6,7 @@
 	 * — supplied by the page in a `contextMap` keyed by item id.
 	 *
 	 * Example use-cases:
-	 * - `/trash`: `date = deletion_date`, `extras = { driveId, trashedAt }`.
+	 * - `/trash`: `date = expires_at`, `extras = { driveId, trashedAt }`.
 	 * - `/recent`: `date = accessed_at`, `ownerId = updated_by`.
 	 * - `/favorites`: `ownerId = created_by`.
 	 *
@@ -34,10 +34,21 @@
 	 * and `labelOf` maps that key to a header label. Omitting `bucketOf` means a
 	 * flat list.
 	 */
-	export interface GroupByDef {
+	/**
+	 * A group-by option offered in the listing's dropdown.
+	 *
+	 * Generic over the sort axis (§7). It defaults to `string` so routes
+	 * whose endpoint still takes an untyped `order_by` keep compiling, but a
+	 * route whose endpoint has a published `*OrderBy` enum should
+	 * instantiate it with that union — `GroupByDef<RecentOrderBy>[]` — so a
+	 * typo or a retired axis fails `npm run check` instead of becoming a
+	 * runtime 400. `/recent` does this today; the rest follow as their
+	 * enums land.
+	 */
+	export interface GroupByDef<Axis extends string = string> {
 		key: string;
 		label: string;
-		orderBy: string;
+		orderBy: Axis;
 		/** Optional icon for the dropdown option (defaults to the group glyph). */
 		icon?: string;
 		bucketOf?: (item: FileItem | FolderItem, ctx?: ItemContext) => string | null;
@@ -82,9 +93,15 @@
 	}
 </script>
 
-<script lang="ts">
+<script lang="ts" generics="Axis extends string = string">
 	import type { Snippet } from 'svelte';
 	import { SvelteSet } from 'svelte/reactivity';
+	// The "Type" column renders `item.category`, which is the server's
+	// ENGLISH machine key ("Image", "Spreadsheet") — not display text.
+	// `typeLabel` maps it to the localised label. Without this the column
+	// showed raw English on every listing that sets `showType`, while
+	// `/files` was already routing its group-by through the same function.
+	import { typeLabel } from '$lib/utils/resourceBuckets';
 	import Icon from '$lib/icons/Icon.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import SkeletonList from '$lib/components/SkeletonList.svelte';
@@ -99,11 +116,12 @@
 	import { files as filesStore } from '$lib/stores/files.svelte';
 	import { preferences } from '$lib/stores/preferences.svelte';
 	import { formatBytes } from '$lib/utils/format';
-	import { formatDate, iconNameFromClass, fileIconKindClass } from '$lib/utils/display';
+	import { formatDate, iconNameFor, fileIconKindClass } from '$lib/utils/display';
 	import { gridColumns } from '$lib/utils/grid';
 	import { ResourceSectionsBuilder } from '$lib/utils/resourceSections';
 	import { ItemIndexBuilder } from '$lib/utils/itemIndex';
-	import { fileThumbnailUrl, thumbSizeForView } from '$lib/api/endpoints/files';
+	import { fileThumbnailUrl } from '$lib/api/endpoints/files';
+	import { thumbSizeForView } from '$lib/utils/thumbnails';
 	import {
 		canThumbnailClientSide,
 		preloadPdf,
@@ -222,13 +240,20 @@
 		/** Right-click / overflow context-menu actions. */
 		contextActions?: ContextAction[];
 		/** Group-by dimensions; when provided, a swimlane selector is shown. */
-		groupBys?: GroupByDef[];
+		groupBys?: GroupByDef<Axis>[];
 		/** Active group-by key (bind:groupBy from the page). */
 		groupBy?: string;
 		/** Reverse sort toggle state (bind:reversed from the page). */
 		reversed?: boolean;
-		/** Called when group-by or direction changes; page should reload page 1. */
-		onreload?: (orderBy: string, reversed: boolean) => void;
+		/**
+		 * Called when group-by or direction changes; page should reload page 1.
+		 *
+		 * `orderBy` is one of the `groupBys` entries' axes, so it carries the
+		 * page's `Axis` type (§7 part 3g) rather than a bare string — a route
+		 * whose endpoint has a published `*OrderBy` enum can pass this
+		 * straight into its loader with no cast.
+		 */
+		onreload?: (orderBy: Axis, reversed: boolean) => void;
 		onopen?: (item: FileItem | FolderItem) => void;
 		/** Per-item favorite star toggle. */
 		onfavorite?: (item: FileItem | FolderItem) => void;
@@ -503,9 +528,6 @@
 	function mimeOf(item: FileItem | FolderItem): string | null {
 		return isFile(item) ? item.mime_type : null;
 	}
-	function iconClassOf(item: FileItem | FolderItem): string {
-		return item.icon_class;
-	}
 
 	// ── Dotfile filter ────────────────────────────────────────────────────────
 	// Two conditions gate the filter (both must be true):
@@ -598,12 +620,29 @@
 		if (groupBy === key) return;
 		groupBy = key;
 		const def = groupBys?.find((g) => g.key === key);
-		onreload?.(def?.orderBy ?? 'name', reversed);
+		requestReload(def?.orderBy);
 	}
 
 	function toggleDirection() {
 		reversed = !reversed;
-		onreload?.(activeGroup?.orderBy ?? 'name', reversed);
+		requestReload(activeGroup?.orderBy);
+	}
+
+	/**
+	 * Fire `onreload` with a valid axis, or not at all.
+	 *
+	 * §7 part 3g: the two call sites above used to fall back to the literal
+	 * `'name'`, which is not a valid `Axis` for every endpoint — `/photos`
+	 * has no `name` axis at all — so a typed component cannot hardcode it.
+	 * The first `groupBys` entry is the page's own default (its `key` is
+	 * `''`, the no-grouping state), which makes it the correct typed
+	 * fallback. With no `groupBys` there is no axis to sort by, so the
+	 * reload is skipped rather than invented; every route that passes
+	 * `onreload` passes `groupBys` too.
+	 */
+	function requestReload(axis: Axis | undefined) {
+		const resolved = axis ?? groupBys?.[0]?.orderBy;
+		if (resolved !== undefined) onreload?.(resolved, reversed);
 	}
 
 	/**
@@ -1102,7 +1141,7 @@
 
 {#snippet row(item: FileItem | FolderItem)}
 	{@const kind = isFile(item) ? 'file' : 'folder'}
-	{@const iconName = kind === 'folder' ? 'folder' : iconNameFromClass(iconClassOf(item))}
+	{@const iconName = kind === 'folder' ? 'folder' : iconNameFor(item.name, mimeOf(item))}
 	{@const ctx = ctxOf(item.id)}
 	{@const ownerId = ownerIdOf(item)}
 	{@const dateVal = dateOf(item)}
@@ -1208,7 +1247,9 @@
 			</div>
 		{/if}
 		{#if showPath}<div class="path-cell">{item.path ?? ''}</div>{/if}
-		{#if showType}<div class="type-cell">{item.category ?? ''}</div>{/if}
+		{#if showType}<div class="type-cell" data-testid="type-cell">
+				{item.category ? typeLabel(item.category) : ''}
+			</div>{/if}
 		{#if showSize}
 			<div class="size-cell">{sizeVal != null ? formatBytes(sizeVal) : '—'}</div>
 		{/if}

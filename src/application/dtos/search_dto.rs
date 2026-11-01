@@ -1,3 +1,4 @@
+use crate::application::dtos::display_helpers::ResourceCategory;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -7,6 +8,116 @@ use uuid::Uuid;
 
 use crate::application::dtos::cursor::PageCursor;
 use crate::application::dtos::grant_dto::{ResourceContentDto, ResourceTypeDto};
+
+/// Resource-category filter for `GET /api/search` (`?type=`).
+///
+/// Replaces a comma-separated **extension** list (`type=pdf,docx`) matched
+/// against the filename. That shape had three defects, all fixed by moving the
+/// classification server-side:
+///
+/// * the category→extension table lived in the SPA (12 image and 7 audio
+///   extensions hardcoded), so a missed extension silently dropped a file from
+///   its own category;
+/// * extensionless files could never match — the predicate was
+///   `SUBSTRING(name FROM '\.([^.]+)$')`, NULL without a dot, even when
+///   `mime_type` was known;
+/// * folders were never filtered at all, which is the defect a user saw.
+///
+/// `All` and `Folders` deliberately map to no `storage.files` value: a folder
+/// has no row in that table, so those two cases select which UNION branches
+/// run rather than contributing a predicate. Every other variant resolves
+/// through [`category_orders_for_filter`], which is exhaustive over this enum
+/// so a new variant is a compile error there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchTypeFilter {
+    /// Default — no narrowing; files and folders both.
+    #[default]
+    All,
+    /// Folders only. The value that fixes the leak: with any variant other
+    /// than this or `All`, the folder branch is skipped entirely.
+    Folder,
+    Image,
+    Video,
+    Audio,
+    /// Coarser than the DB's grouping on purpose — PDF, office formats,
+    /// markdown and plain text. A user picking Documents wants all of them.
+    Document,
+    Archive,
+    Code,
+    /// Fonts. Server-side only, like `Unknown` below — present so a font
+    /// library can be filtered, not offered in the SPA picker yet.
+    Font,
+    /// Unidentifiable content. Useful to an operator chasing broken type
+    /// detection; the SPA does not offer it until someone asks.
+    ///
+    /// Named `Unknown` to match `ResourceCategory::Unknown` — one bucket,
+    /// one name. It was `Other`, which only ever existed on an unmerged
+    /// branch, so the rename costs no compatibility.
+    Unknown,
+}
+
+impl SearchTypeFilter {
+    /// Whether folder rows belong in the result set.
+    ///
+    /// This is the fix for the reported defect: `search_folders` has no type
+    /// parameter, so a folder could never be *narrowed* — the only correct
+    /// behaviour is to include folders or not run the folder query at all.
+    /// Picking "Images" therefore excludes folders, which is what the
+    /// affordance means to a user.
+    pub fn includes_folders(self) -> bool {
+        matches!(self, Self::All | Self::Folder)
+    }
+
+    /// Whether file rows belong in the result set.
+    ///
+    /// Load-bearing for `Folders`: that variant maps to an EMPTY
+    /// `category_order` set, and an empty set contributes no SQL predicate —
+    /// so without this gate the file branch would return *every* file rather
+    /// than none. The empty slice means "no narrowing", never "nothing
+    /// matches".
+    pub fn includes_files(self) -> bool {
+        !matches!(self, Self::Folder)
+    }
+}
+
+/// Sort axis for `GET /api/search` (§7).
+///
+/// Typed rather than `String` so an unknown axis is refused at
+/// wire-decode time instead of silently falling back to the default. See
+/// [`crate::application::dtos::trash_dto::TrashOrderBy`] for why these are
+/// per-endpoint enums rather than one shared union — `Relevance` only
+/// exists here, and is meaningless on every other listing.
+///
+/// Direction is the orthogonal `reverse` boolean, NOT a `_desc` suffix on
+/// the axis. That pattern was retired 2026-07-26; typing the axis is what
+/// finally made the leftover `name_desc` / `date` / `date_desc` arms in
+/// the recursive search path impossible to leave lying around (§7 part
+/// 3e — they were dead spellings whose presence hid a real bug, see
+/// `sort_enriched_folders`).
+///
+/// `Hash` is required: this rides on `SearchCriteriaDto`, which is hashed
+/// to key the search result cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchOrderBy {
+    /// Default — best text match first. `reverse` is a no-op here: a
+    /// least-relevant-first ordering has no use.
+    #[default]
+    Relevance,
+    /// Alphabetical. The only axis where folders are grouped before
+    /// files, matching the file-manager convention.
+    Name,
+    /// By byte size. Not meaningful for folders (no size column), so
+    /// folder rows keep relevance order on this axis.
+    Size,
+    /// The item's content clock (`content_modified_at`) — §2 repointed
+    /// this off `updated_at`, so a rename or move no longer resurfaces a
+    /// row; only a real content change does.
+    ModifiedAt,
+    /// When the row was created on this server (immutable).
+    CreatedAt,
+}
 
 /**
  * Data Transfer Object for file search criteria.
@@ -21,9 +132,20 @@ pub struct SearchCriteriaDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name_contains: Option<String>,
 
-    /// Optional list of file extensions to include (e.g., "pdf", "jpg")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file_types: Option<Vec<String>>,
+    /// Resource-category narrowing — see [`SearchTypeFilter`].
+    ///
+    /// Was `file_types: Option<Vec<String>>`, a list of filename extensions
+    /// the SPA assembled. Carrying the category instead keeps the
+    /// extension→category table on the server (one copy, next to
+    /// `category_order_for`) and lets the SQL filter on the indexed
+    /// `storage.files.category_order` rather than re-deriving an extension
+    /// from the name at query time.
+    ///
+    /// Not `Option`: `All` is the honest default, and a `Copy` enum also
+    /// makes this struct's `Hash` — which keys the search result cache —
+    /// cheaper and stabler than a `Vec<String>` whose order could vary.
+    #[serde(default)]
+    pub type_filter: SearchTypeFilter,
 
     /// Optional minimum creation date (seconds since epoch)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,13 +187,12 @@ pub struct SearchCriteriaDto {
     #[serde(default)]
     pub offset: usize,
 
-    /// Sort dimension. Canonical set: `"relevance"` | `"name"` | `"size"`
-    /// | `"updated_at"` | `"created_at"`. Direction is `reverse` below —
-    /// the `_desc` suffix pattern was retired 2026-07-26 in favour of
-    /// a single boolean, so every consumer treats "which column" and
+    /// Sort dimension — see [`SearchOrderBy`]. Direction is `reverse`
+    /// below; the `_desc` suffix pattern was retired 2026-07-26 in favour
+    /// of a single boolean, so every consumer treats "which column" and
     /// "which direction" as orthogonal concerns.
-    #[serde(default = "default_sort_by")]
-    pub sort_by: String,
+    #[serde(default)]
+    pub order_by: SearchOrderBy,
 
     /// Reverse the sort direction — descending for name/size/date,
     /// no-op for `relevance` (a descending relevance sort is meaningless).
@@ -89,16 +210,11 @@ fn default_limit() -> usize {
     100
 }
 
-/// Default sort_by value
-fn default_sort_by() -> String {
-    "relevance".to_string()
-}
-
 impl Default for SearchCriteriaDto {
     fn default() -> Self {
         Self {
             name_contains: None,
-            file_types: None,
+            type_filter: SearchTypeFilter::All,
             created_after: None,
             created_before: None,
             modified_after: None,
@@ -109,7 +225,7 @@ impl Default for SearchCriteriaDto {
             recursive: default_recursive(),
             limit: default_limit(),
             offset: 0,
-            sort_by: default_sort_by(),
+            order_by: SearchOrderBy::default(),
             reverse: false,
         }
     }
@@ -147,17 +263,12 @@ pub struct SearchFileResultDto {
     pub modified_at: DateTime<Utc>,
     /// Relevance score (0-100) computed server-side
     pub relevance_score: u32,
-    /// Human-readable file size (e.g., "2.5 MB")
-    pub size_formatted: String,
-    /// CSS icon class for the file type (e.g., "fas fa-file-pdf")
-    #[schema(value_type = String)]
-    pub icon_class: Arc<str>,
-    /// Extra CSS class for icon styling (e.g., "pdf-icon", "code-icon js-icon")
-    #[schema(value_type = String)]
-    pub icon_special_class: Arc<str>,
-    /// Content category: "document", "image", "video", "audio", "archive", "code", "other"
-    #[schema(value_type = String)]
-    pub category: Arc<str>,
+    /// Coarse content category — a stable machine key, not display text.
+    /// Carried through from `FileDto::category`; see that field for the full
+    /// contract. (This comment used to claim lowercase values — "document",
+    /// "image", … — which it never carried: `enrich_file` copies the
+    /// capitalised `category_for` output verbatim.)
+    pub category: ResourceCategory,
     /// Raw BLAKE3 content hash. Feeds `FileDto::content_hash` and
     /// `File::compute_etag` when search results are converted to
     /// `FileDto` (NC REPORT/SEARCH response). Defaults to `String::new()`
@@ -221,8 +332,6 @@ pub struct SearchFolderResultDto {
     pub created_at: DateTime<Utc>,
     /// Last modification timestamp (RFC 3339 UTC).
     pub modified_at: DateTime<Utc>,
-    /// Whether it is a root folder
-    pub is_root: bool,
     /// Relevance score (0-100) computed server-side
     pub relevance_score: u32,
     /// HTTP ETag — folders derive theirs from the tree-etag propagator.
@@ -277,7 +386,7 @@ pub struct SearchResultsDto {
     pub query_time_ms: u64,
 
     /// Sort order used
-    pub sort_by: String,
+    pub order_by: SearchOrderBy,
 }
 
 impl SearchResultsDto {
@@ -291,7 +400,7 @@ impl SearchResultsDto {
             offset: 0,
             has_more: false,
             query_time_ms: 0,
-            sort_by: "relevance".to_string(),
+            order_by: SearchOrderBy::Relevance,
         }
     }
 
@@ -303,7 +412,7 @@ impl SearchResultsDto {
         offset: usize,
         total_count: Option<usize>,
         query_time_ms: u64,
-        sort_by: String,
+        order_by: SearchOrderBy,
     ) -> Self {
         let has_more = match total_count {
             Some(total) => (offset + files.len() + folders.len()) < total,
@@ -318,7 +427,7 @@ impl SearchResultsDto {
             offset,
             has_more,
             query_time_ms,
-            sort_by,
+            order_by,
         }
     }
 }
@@ -356,12 +465,12 @@ pub struct SearchResourcesQuery {
     pub cursor: Option<String>,
 
     /// Sort dimension. Supported: `"relevance"` (default), `"name"`,
-    /// `"size"`, `"updated_at"`, `"created_at"`. Direction is the
+    /// `"size"`, `"modified_at"`, `"created_at"`. Direction is the
     /// separate `reverse` flag — the historical `_desc` suffix pattern
     /// (`name_desc`, `date_desc`, `size_desc`) was retired 2026-07-26
     /// in favour of a single boolean, and `"date"` was renamed to the
-    /// more explicit `"updated_at"` alongside the new `"created_at"`.
-    pub order_by: Option<String>,
+    /// more explicit `"modified_at"` alongside the new `"created_at"`.
+    pub order_by: Option<SearchOrderBy>,
 
     /// Comma-separated resource types to include, e.g. `"file,folder"`.
     /// Absent = both. Matches the `FolderResourcesQuery` idiom.
@@ -371,9 +480,12 @@ pub struct SearchResourcesQuery {
     #[serde(default)]
     pub reverse: bool,
 
-    /// Comma-separated file extensions filter, e.g. `"pdf,docx"`.
+    /// Resource-category filter — see [`SearchTypeFilter`]. Omit for `all`.
+    ///
+    /// Was a comma-separated **extension** list (`type=pdf,docx`); the enum's
+    /// doc records why that shape was replaced.
     #[serde(rename = "type")]
-    pub type_filter: Option<String>,
+    pub type_filter: Option<SearchTypeFilter>,
 
     /// Restrict search to this folder.
     pub folder_id: Option<String>,
@@ -413,20 +525,17 @@ impl SearchResourcesQuery {
     }
     /// Convert to the internal `SearchCriteriaDto` the service consumes.
     /// `limit` / `offset` come from the decoded cursor (or the query's
-    /// `limit` on the first page). `sort_by` + `reverse` pass through as
+    /// `limit` on the first page). `order_by` + `reverse` pass through as
     /// two orthogonal fields — every downstream consumer (SQL builders,
     /// in-memory folder sort) reads both.
     pub fn to_criteria(&self) -> SearchCriteriaDto {
         let offset = self.decode_cursor().map(|c| c.offset).unwrap_or(0);
-        let file_types = self.type_filter.as_deref().map(|s| {
-            s.split(',')
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect()
-        });
+        // No splitting or trimming any more: the wire carries one typed
+        // category token, so serde has already validated it and an absent
+        // value means `All`.
         SearchCriteriaDto {
             name_contains: self.query.clone(),
-            file_types,
+            type_filter: self.type_filter.unwrap_or_default(),
             created_after: self.created_after,
             created_before: self.created_before,
             modified_after: self.modified_after,
@@ -437,7 +546,7 @@ impl SearchResourcesQuery {
             recursive: self.recursive,
             limit: self.limit_clamped(),
             offset,
-            sort_by: self.order_by.clone().unwrap_or_else(default_sort_by),
+            order_by: self.order_by.unwrap_or_default(),
             reverse: self.reverse,
         }
     }
@@ -465,7 +574,10 @@ impl SearchResourcesQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResourceCursor {
     pub offset: usize,
-    pub order_by: String,
+    /// §7: typed, so a cursor minted on one axis cannot be replayed
+    /// against another without the handler noticing.
+    #[serde(default)]
+    pub order_by: SearchOrderBy,
 }
 impl PageCursor for SearchResourceCursor {}
 
@@ -537,7 +649,7 @@ impl SearchResourcesDto {
         results: crate::application::dtos::search_dto::SearchResultsDto,
         query: &SearchResourcesQuery,
     ) -> Self {
-        let order_by = query.order_by.clone().unwrap_or_else(default_sort_by);
+        let order_by = query.order_by.unwrap_or_default();
         let current_offset = query.decode_cursor().map(|c| c.offset).unwrap_or(0);
         let returned = results.files.len() + results.folders.len();
 
@@ -545,7 +657,7 @@ impl SearchResourcesDto {
             Some(
                 SearchResourceCursor {
                     offset: current_offset + returned,
-                    order_by: order_by.clone(),
+                    order_by,
                 }
                 .encode(),
             )
@@ -567,7 +679,11 @@ impl SearchResourcesDto {
             .as_deref()
             .map(|s| s.to_lowercase())
             .unwrap_or_default();
-        let folders_first = matches!(order_by.as_str(), "name" | "name_desc");
+        // §7: `name` is the only axis that groups folders before files —
+        // the file-manager convention. The retired `"name_desc"` spelling
+        // was still listed here; direction is the orthogonal `reverse`
+        // flag and never part of the axis.
+        let folders_first = order_by == SearchOrderBy::Name;
 
         if folders_first {
             append_folders(&mut items, results.folders);
@@ -580,7 +696,7 @@ impl SearchResourcesDto {
             // for size/date since the two arrays are individually ordered.
             append_folders(&mut items, results.folders);
             append_files(&mut items, results.files, &query_lower);
-            if order_by == "relevance" {
+            if order_by == SearchOrderBy::Relevance {
                 items.sort_by_key(|item| std::cmp::Reverse(item.meta.score));
             }
         }
@@ -605,10 +721,10 @@ fn append_files(
             snippet: f.snippet.clone(),
             via: f.match_source.clone(),
         };
-        // Reconstruct FileDto from the enriched search result. `size_formatted`
-        // and display fields were already computed by `enrich_file`; the
-        // Phase 1-plus extensions (etag / created_by / updated_by /
-        // is_favorite / is_shared) carry through so the DTO is complete.
+        // Reconstruct FileDto from the enriched search result. The display
+        // fields were already computed by `enrich_file`; the Phase 1-plus
+        // extensions (etag / created_by / updated_by / is_favorite /
+        // is_shared) carry through so the DTO is complete.
         let file_dto = crate::application::dtos::file_dto::FileDto {
             id: f.id,
             name: f.name,
@@ -618,10 +734,7 @@ fn append_files(
             folder_id: f.folder_id,
             created_at: f.created_at,
             modified_at: f.modified_at,
-            icon_class: f.icon_class,
-            icon_special_class: f.icon_special_class,
             category: f.category,
-            size_formatted: f.size_formatted,
             content_hash: f.blob_hash,
             etag: f.etag,
             created_by: f.created_by,
@@ -652,13 +765,15 @@ fn append_folders(items: &mut Vec<SearchResourceItem>, folders: Vec<SearchFolder
             drive_id: f.drive_id,
             created_at: f.created_at,
             modified_at: f.modified_at,
-            is_root: f.is_root,
-            // Folders carry closed-set display fields — always the
-            // same three static strings. Cheap to build via `Arc::from`
-            // (interning-worthy but not on the search hot path).
-            icon_class: Arc::from("fas fa-folder"),
-            icon_special_class: Arc::from("folder-icon"),
-            category: Arc::from("Folder"),
+            // Search hits carry no subtree rollup, and search results are a
+            // REST surface that never emits `D:getlastmodified`, so the
+            // folder's own mtime stands in rather than a claim about
+            // descendants.
+            tree_modified_at: f.modified_at,
+            // Folders carry a closed-set display field — always the same
+            // static string. Cheap to build via `Arc::from` (interning-worthy
+            // but not on the search hot path).
+            category: ResourceCategory::Folder,
             etag: f.etag,
             created_by: f.created_by,
             updated_by: f.updated_by,
@@ -700,12 +815,14 @@ pub struct SearchSuggestionItem {
     pub id: String,
     /// Path for context
     pub path: String,
-    /// CSS icon class
+    /// MIME type, so the client can pick its own glyph.
+    ///
+    /// Replaced `icon_class` (a CSS class string) in step 4 of
+    /// `docs/plan/retire-precomputed-display-fields.md`. Folders carry
+    /// `"directory"`, matching the convention elsewhere in the storage layer —
+    /// clients branch on `item_type` for those and never consult this.
     #[schema(value_type = String)]
-    pub icon_class: Arc<str>,
-    /// Extra CSS class for icon styling
-    #[schema(value_type = String)]
-    pub icon_special_class: Arc<str>,
+    pub mime_type: Arc<str>,
     /// Relevance score
     pub relevance_score: u32,
 }

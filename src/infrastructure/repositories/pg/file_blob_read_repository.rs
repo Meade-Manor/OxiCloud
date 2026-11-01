@@ -31,18 +31,23 @@ struct MediaResourceDbRow {
     updated_by: Option<Uuid>,
     is_favorite: bool,
     is_shared: bool,
-    /// Epoch seconds of the chosen sort axis — client-facing precision.
-    sort_date: i64,
-    /// Full-precision `timestamptz` of the chosen sort axis — the
-    /// opaque cursor keys off this value so the WHERE predicate can
-    /// compare at column fidelity. Carrying only `sort_date` (seconds)
-    /// drops rows that landed inside the same wall-clock second as
-    /// the page boundary.
+    /// Full-precision `timestamptz` of the chosen sort axis. Both the
+    /// opaque cursor and the client-facing `sort_date` read this, so the
+    /// cursor's WHERE predicate compares at column fidelity — a
+    /// seconds-truncated value drops rows that landed inside the same
+    /// wall-clock second as the page boundary.
+    ///
+    /// There used to be a second `sort_date: i64` column here carrying
+    /// the same instant truncated to seconds, for the wire. The wire is
+    /// RFC 3339 now, so the truncation (and the extra `EXTRACT`) is
+    /// gone.
     sort_date_ts: chrono::DateTime<chrono::Utc>,
     width: Option<i32>,
     height: Option<i32>,
-    /// Raw EXIF capture time, epoch seconds, nullable.
-    captured_at: Option<i64>,
+    /// Raw EXIF capture time, nullable. Selected as the raw
+    /// `timestamptz`; it reaches the wire as RFC 3339 like every other
+    /// timestamp.
+    captured_at: Option<chrono::DateTime<chrono::Utc>>,
     /// EXIF TIFF orientation (1-8), nullable.
     orientation: Option<i16>,
     /// `latitude IS NOT NULL AND longitude IS NOT NULL`.
@@ -62,17 +67,19 @@ struct MediaResourceDbRow {
 /// balloon the parallel-vector pattern [`list_media_files`] still uses.
 pub struct MediaResourceRow {
     pub file: File,
-    /// Sort axis value for this row, epoch seconds. Matches
-    /// `storage.files.media_sort_date` on the `CapturedAt` axis;
-    /// equal to `created_at` on the `CreatedAt` axis (reserved for §3).
-    pub sort_date: i64,
-    /// Full-precision timestamp of the chosen sort axis — the
-    /// handler uses this to build the opaque keyset cursor so the
-    /// WHERE predicate on the next page compares at column fidelity
-    /// (microsecond, not the truncated second `sort_date` exposes to
-    /// clients).
+    /// Value of the chosen sort axis for this row, at full column
+    /// fidelity. `storage.files.media_sort_date` on the `CapturedAt`
+    /// axis, `created_at` on `CreatedAt`, `content_modified_at` on
+    /// `UpdatedAt`.
+    ///
+    /// Feeds both the opaque keyset cursor and the wire `sort_date`.
+    /// The two were separate fields while the wire carried epoch
+    /// seconds — keeping microseconds for the cursor (so the next
+    /// page's WHERE does not drop rows inside the boundary second) and
+    /// a truncated copy for clients. The wire is RFC 3339 now, so one
+    /// field serves both.
     pub sort_date_ts: chrono::DateTime<chrono::Utc>,
-    pub captured_at: Option<i64>,
+    pub captured_at: Option<chrono::DateTime<chrono::Utc>>,
     pub orientation: Option<i16>,
     pub width: Option<i32>,
     pub height: Option<i32>,
@@ -95,8 +102,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::application::dtos::display_helpers::category_orders_for_filter;
 use crate::application::dtos::geo_dto::{GeoBounds, GeoCluster};
-use crate::application::dtos::search_dto::SearchCriteriaDto;
+use crate::application::dtos::search_dto::{SearchCriteriaDto, SearchOrderBy};
 use crate::application::ports::storage_ports::FileReadPort;
 use crate::common::errors::DomainError;
 use crate::domain::entities::file::File;
@@ -167,13 +175,18 @@ fn push_criteria_filters(
     mut bind_idx: u32,
     criteria: &SearchCriteriaDto,
 ) -> u32 {
-    if let Some(types) = &criteria.file_types
-        && !types.is_empty()
-    {
+    // Category filter on the indexed `storage.files.category_order` rather
+    // than re-deriving an extension from the filename. The old predicate was
+    // `LOWER(SUBSTRING(fi.name FROM '\.([^.]+)$')) = ANY($n)`, which could
+    // never match a file without a dot in its name — even when its mime was
+    // known — and depended on the SPA shipping a complete extension list.
+    //
+    // An empty slice means the filter contributes no predicate: that is `All`
+    // and `Folders`, neither of which narrows the FILE branch (`Folders`
+    // suppresses it entirely, upstream in the service).
+    if !category_orders_for_filter(criteria.type_filter).is_empty() {
         bind_idx += 1;
-        conditions.push(format!(
-            "LOWER(SUBSTRING(fi.name FROM '\\.([^.]+)$')) = ANY(${bind_idx})"
-        ));
+        conditions.push(format!("fi.category_order = ANY(${bind_idx})"));
     }
     if criteria.created_after.is_some() {
         bind_idx += 1;
@@ -190,13 +203,13 @@ fn push_criteria_filters(
     if criteria.modified_after.is_some() {
         bind_idx += 1;
         conditions.push(format!(
-            "EXTRACT(EPOCH FROM fi.updated_at)::bigint >= ${bind_idx}"
+            "EXTRACT(EPOCH FROM fi.content_modified_at)::bigint >= ${bind_idx}"
         ));
     }
     if criteria.modified_before.is_some() {
         bind_idx += 1;
         conditions.push(format!(
-            "EXTRACT(EPOCH FROM fi.updated_at)::bigint <= ${bind_idx}"
+            "EXTRACT(EPOCH FROM fi.content_modified_at)::bigint <= ${bind_idx}"
         ));
     }
     if criteria.min_size.is_some() {
@@ -216,11 +229,12 @@ fn bind_criteria_filters<'q, O>(
     mut query: sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>,
     criteria: &SearchCriteriaDto,
 ) -> sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments> {
-    if let Some(types) = &criteria.file_types
-        && !types.is_empty()
-    {
-        let lower_types: Vec<String> = types.iter().map(|t| t.to_lowercase()).collect();
-        query = query.bind(lower_types);
+    // Mirror of the predicate in `push_criteria_filters` — the two must bind
+    // the same number of parameters in the same order, so the emptiness test
+    // here has to match that one exactly.
+    let category_orders = category_orders_for_filter(criteria.type_filter);
+    if !category_orders.is_empty() {
+        query = query.bind(category_orders.to_vec());
     }
     if let Some(v) = criteria.created_after {
         query = query.bind(v as i64);
@@ -332,7 +346,7 @@ impl FileBlobReadRepository {
             "SELECT fi.id, fi.name, fi.folder_id, fo.path, \
                     fi.size, fi.mime_type, \
                     EXTRACT(EPOCH FROM fi.created_at)::bigint, \
-                    EXTRACT(EPOCH FROM fi.updated_at)::bigint, \
+                    EXTRACT(EPOCH FROM fi.content_modified_at)::bigint, \
                     fi.blob_hash, \
                     \
                     fi.created_by, fi.updated_by \
@@ -386,7 +400,7 @@ impl FileBlobReadRepository {
             "SELECT fi.id, fi.name, fi.folder_id, fo.path, \
                     fi.size, fi.mime_type, \
                     EXTRACT(EPOCH FROM fi.created_at)::bigint, \
-                    EXTRACT(EPOCH FROM fi.updated_at)::bigint, \
+                    EXTRACT(EPOCH FROM fi.content_modified_at)::bigint, \
                     fi.blob_hash, \
                     \
                     fi.created_by, fi.updated_by \
@@ -583,7 +597,13 @@ impl FileBlobReadRepository {
         let sort_col = match filter.order_by {
             PhotoOrderBy::CapturedAt => "media_sort_date",
             PhotoOrderBy::CreatedAt => "created_at",
-            PhotoOrderBy::UpdatedAt => "updated_at",
+            // §3 — the content clock, not the row clock. A rename or a
+            // trash transition no longer resurfaces a photo on this axis;
+            // only a real content mutation does. The wire value is still
+            // spelled `updated_at` — plan §6 renames it to `modified_at`,
+            // which is the point at which the token stops disagreeing with
+            // the column it resolves to.
+            PhotoOrderBy::ModifiedAt => "content_modified_at",
         };
         let (dir, cmp) = if filter.reverse {
             ("ASC", ">")
@@ -692,7 +712,7 @@ impl FileBlobReadRepository {
                    top.size                                   AS size,
                    top.mime_type                              AS mime_type,
                    EXTRACT(EPOCH FROM top.created_at)::bigint AS created_at,
-                   EXTRACT(EPOCH FROM top.updated_at)::bigint AS updated_at,
+                   EXTRACT(EPOCH FROM top.content_modified_at)::bigint AS updated_at,
                    top.blob_hash                              AS blob_hash,
                    top.created_by                             AS created_by,
                    top.updated_by                             AS updated_by,
@@ -707,14 +727,10 @@ impl FileBlobReadRepository {
                         WHERE g.resource_id   = top.id
                           AND g.resource_type = 'file'
                    )                                          AS is_shared,
-                   EXTRACT(EPOCH FROM top.{sort_col})::bigint AS sort_date,
                    top.{sort_col}                             AS sort_date_ts,
                    fm.width                                   AS width,
                    fm.height                                  AS height,
-                   CASE
-                       WHEN fm.captured_at IS NULL THEN NULL
-                       ELSE EXTRACT(EPOCH FROM fm.captured_at)::bigint
-                   END                                        AS captured_at,
+                   fm.created_at                              AS captured_at,
                    fm.orientation                             AS orientation,
                    (fm.latitude IS NOT NULL AND fm.longitude IS NOT NULL) AS has_gps,
                    -- §9b Layer 1 — within-drive sibling probe. True when
@@ -758,7 +774,7 @@ impl FileBlobReadRepository {
                  LIMIT $4
               ) top
               LEFT JOIN storage.folders fo ON fo.id = top.folder_id
-              LEFT JOIN storage.file_metadata fm ON fm.file_id = top.id
+              LEFT JOIN storage.content_metadata fm ON fm.source_hash = top.blob_hash
              ORDER BY top.{sort_col} {dir}, top.id {dir}
             "#,
         );
@@ -791,7 +807,7 @@ impl FileBlobReadRepository {
             )?;
             out.push(MediaResourceRow {
                 file,
-                sort_date: r.sort_date,
+
                 sort_date_ts: r.sort_date_ts,
                 captured_at: r.captured_at,
                 orientation: r.orientation,
@@ -829,14 +845,21 @@ impl FileBlobReadRepository {
             SELECT count(*)              AS n,
                    avg(fm.longitude)     AS clng,
                    avg(fm.latitude)      AS clat,
-                   -- NOTE: `min(fm.file_id)::text` (cast per cluster, not
-                   -- per row) was attempted in ROUND11 §Q4 and REJECTED by
-                   -- its benchmark gate: PostgreSQL has no `min(uuid)`
+                   -- The sample comes from `fi`, not `fm`: metadata is
+                   -- content-keyed, so the row has no file id to take —
+                   -- one content row backs every copy of the photo. It
+                   -- MUST come from the joined, drive-filtered side
+                   -- anyway, or the cluster could name a file the caller
+                   -- cannot see.
+                   --
+                   -- NOTE: `min(...)::text` (cast per cluster, not per
+                   -- row) was attempted in ROUND11 §Q4 and REJECTED by its
+                   -- benchmark gate: PostgreSQL has no `min(uuid)`
                    -- aggregate, and adding a custom one is schema surface
                    -- this viewport query doesn't justify.
-                   min(fm.file_id::text) AS sample_id
-              FROM storage.file_metadata fm
-              JOIN storage.files fi ON fi.id = fm.file_id
+                   min(fi.id::text)      AS sample_id
+              FROM storage.content_metadata fm
+              JOIN storage.files fi ON fi.blob_hash = fm.source_hash
              WHERE fi.drive_id IN (
                      -- Same `storage.caller_accessible_drives` the Photos
                      -- timeline runs through — the two surfaces MUST agree
@@ -899,7 +922,7 @@ impl FileReadPort for FileBlobReadRepository {
             SELECT fi.id, fi.name, fi.folder_id, fo.path,
                    fi.size, fi.mime_type,
                    EXTRACT(EPOCH FROM fi.created_at)::bigint,
-                   EXTRACT(EPOCH FROM fi.updated_at)::bigint,
+                   EXTRACT(EPOCH FROM fi.content_modified_at)::bigint,
                    fi.blob_hash,
                    fi.created_by, fi.updated_by
               FROM storage.files fi
@@ -946,7 +969,7 @@ impl FileReadPort for FileBlobReadRepository {
             SELECT fi.id, fi.name, fi.folder_id, fo.path,
                    fi.size, fi.mime_type,
                    EXTRACT(EPOCH FROM fi.created_at)::bigint,
-                   EXTRACT(EPOCH FROM fi.updated_at)::bigint,
+                   EXTRACT(EPOCH FROM fi.content_modified_at)::bigint,
                    fi.blob_hash,
                    fi.created_by, fi.updated_by
               FROM storage.files fi
@@ -974,7 +997,7 @@ impl FileReadPort for FileBlobReadRepository {
                 SELECT fi.id, fi.name, fi.folder_id, fo.path,
                        fi.size, fi.mime_type,
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
-                       EXTRACT(EPOCH FROM fi.updated_at)::bigint,
+                       EXTRACT(EPOCH FROM fi.content_modified_at)::bigint,
                        fi.blob_hash,
 
                    fi.created_by, fi.updated_by
@@ -993,7 +1016,7 @@ impl FileReadPort for FileBlobReadRepository {
                 SELECT fi.id, fi.name, fi.folder_id, fo.path,
                        fi.size, fi.mime_type,
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
-                       EXTRACT(EPOCH FROM fi.updated_at)::bigint,
+                       EXTRACT(EPOCH FROM fi.content_modified_at)::bigint,
                        fi.blob_hash,
 
                    fi.created_by, fi.updated_by
@@ -1054,7 +1077,7 @@ impl FileReadPort for FileBlobReadRepository {
             SELECT fi.id, fi.name, fi.folder_id, fo.path,
                    fi.size, fi.mime_type,
                    EXTRACT(EPOCH FROM fi.created_at)::bigint,
-                   EXTRACT(EPOCH FROM fi.updated_at)::bigint,
+                   EXTRACT(EPOCH FROM fi.content_modified_at)::bigint,
                    fi.blob_hash,
 
                fi.created_by, fi.updated_by
@@ -1234,7 +1257,7 @@ impl FileReadPort for FileBlobReadRepository {
                 SELECT fi.id, fi.name, fi.folder_id, fo.path,
                        fi.size, fi.mime_type,
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
-                       EXTRACT(EPOCH FROM fi.updated_at)::bigint,
+                       EXTRACT(EPOCH FROM fi.content_modified_at)::bigint,
                        fi.blob_hash,
                        fi.created_by, fi.updated_by
                   FROM storage.files fi
@@ -1272,7 +1295,7 @@ impl FileReadPort for FileBlobReadRepository {
                 SELECT fi.id, fi.name, fi.folder_id, fo.path,
                        fi.size, fi.mime_type,
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
-                       EXTRACT(EPOCH FROM fi.updated_at)::bigint,
+                       EXTRACT(EPOCH FROM fi.content_modified_at)::bigint,
                        fi.blob_hash,
                        fi.created_by, fi.updated_by
                   FROM storage.files fi
@@ -1318,7 +1341,7 @@ impl FileReadPort for FileBlobReadRepository {
                 SELECT fi.id, fi.name, fi.folder_id, fo.path,
                        fi.size, fi.mime_type,
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
-                       EXTRACT(EPOCH FROM fi.updated_at)::bigint,
+                       EXTRACT(EPOCH FROM fi.content_modified_at)::bigint,
                        fi.blob_hash,
                        fi.created_by, fi.updated_by
                   FROM storage.files fi
@@ -1363,21 +1386,28 @@ impl FileReadPort for FileBlobReadRepository {
         let offset = criteria.offset as i64;
         let limit = criteria.limit as i64;
 
-        // Determine sort order. Canonical `sort_by` set (matches the wire
+        // Determine sort order. Canonical `order_by` set (matches the wire
         // `SearchResourcesQuery.order_by` 1:1 — no rename at any layer):
         // `relevance | name | size | updated_at | created_at`. Direction
         // comes from `criteria.reverse`; the old `_desc`-suffix pattern
         // was retired 2026-07-26.
-        let order_column = match criteria.sort_by.as_str() {
-            "name" => "fi.name",
-            "updated_at" => "fi.updated_at",
-            "created_at" => "fi.created_at",
-            "size" => "fi.size",
-            // `relevance` (or anything unrecognised) has no dedicated
-            // column here — the recursive/non-recursive services blend
-            // in content-index hits and re-sort in memory. Falling back
-            // to name keeps the SQL page stable.
-            _ => "fi.name",
+        let order_column = match criteria.order_by {
+            SearchOrderBy::Name => "fi.name",
+            // §3 — the content clock. This has to agree with
+            // `search_service::sort_enriched_files`, which re-sorts the
+            // merged page in memory on `SearchFileResultDto.modified_at`:
+            // §2 repointed that DTO field at `content_modified_at`, so a
+            // SQL page still ordered by `fi.updated_at` would be re-ordered
+            // on a different clock the moment content hits were blended in.
+            SearchOrderBy::ModifiedAt => "fi.content_modified_at",
+            SearchOrderBy::CreatedAt => "fi.created_at",
+            SearchOrderBy::Size => "fi.size",
+            // `relevance` has no dedicated column here — the
+            // recursive/non-recursive services blend in content-index
+            // hits and re-sort in memory. Falling back to name keeps the
+            // SQL page stable. §7: named explicitly, so a new axis is a
+            // compile error that must choose its own column.
+            SearchOrderBy::Relevance => "fi.name",
         };
         let order_dir = if criteria.reverse { "DESC" } else { "ASC" };
 
@@ -1399,6 +1429,20 @@ impl FileReadPort for FileBlobReadRepository {
             bind_idx += 1;
             conditions.push(format!("fi.name ILIKE ${bind_idx}"));
         }
+        // This call was MISSING, and that was a real bug — not just for the
+        // category filter this change adds.
+        //
+        // `search_files_in_subtree` delegates here whenever `folder_id` is
+        // None (its first `match` arm), so this function serves EVERY global
+        // search. Without the shared filters it applied only `folder_id` and
+        // `name ILIKE`, which meant a search with no folder scope silently
+        // ignored the category, size AND date filters — all three of which
+        // the `/search` UI offers. Narrowing by "Images" or "Last week"
+        // returned the unfiltered set and looked like the filter did nothing.
+        //
+        // `search_files_in_subtree` already called this; only the delegating
+        // path did not.
+        bind_idx = push_criteria_filters(&mut conditions, bind_idx, criteria);
 
         let where_clause = conditions.join(" AND ");
         let limit_bind = bind_idx + 1;
@@ -1417,7 +1461,7 @@ impl FileReadPort for FileBlobReadRepository {
             "SELECT fi.id, fi.name, fi.folder_id, fo.path, \
                     fi.size, fi.mime_type, \
                     EXTRACT(EPOCH FROM fi.created_at)::bigint, \
-                    EXTRACT(EPOCH FROM fi.updated_at)::bigint, \
+                    EXTRACT(EPOCH FROM fi.content_modified_at)::bigint, \
                     fi.blob_hash, \
                     \
                     fi.created_by, fi.updated_by, \
@@ -1470,6 +1514,12 @@ impl FileReadPort for FileBlobReadRepository {
         {
             query = query.bind(super::like_escape(name));
         }
+        // Must sit here: after the name bind and BEFORE limit/offset, mirroring
+        // the order `push_criteria_filters` appended its placeholders above.
+        // Binding out of order would silently compare the wrong columns —
+        // `limit_bind`/`offset_bind` are computed from the advanced `bind_idx`,
+        // so the two sides only line up if this stays between them.
+        query = bind_criteria_filters(query, criteria);
         query = query.bind(limit).bind(offset);
 
         // ── Execute single query ─────────────────────────────────────────
@@ -1530,21 +1580,28 @@ impl FileReadPort for FileBlobReadRepository {
         let offset = criteria.offset as i64;
         let limit = criteria.limit as i64;
 
-        // Determine sort order. Canonical `sort_by` set (matches the wire
+        // Determine sort order. Canonical `order_by` set (matches the wire
         // `SearchResourcesQuery.order_by` 1:1 — no rename at any layer):
         // `relevance | name | size | updated_at | created_at`. Direction
         // comes from `criteria.reverse`; the old `_desc`-suffix pattern
         // was retired 2026-07-26.
-        let order_column = match criteria.sort_by.as_str() {
-            "name" => "fi.name",
-            "updated_at" => "fi.updated_at",
-            "created_at" => "fi.created_at",
-            "size" => "fi.size",
-            // `relevance` (or anything unrecognised) has no dedicated
-            // column here — the recursive/non-recursive services blend
-            // in content-index hits and re-sort in memory. Falling back
-            // to name keeps the SQL page stable.
-            _ => "fi.name",
+        let order_column = match criteria.order_by {
+            SearchOrderBy::Name => "fi.name",
+            // §3 — the content clock. This has to agree with
+            // `search_service::sort_enriched_files`, which re-sorts the
+            // merged page in memory on `SearchFileResultDto.modified_at`:
+            // §2 repointed that DTO field at `content_modified_at`, so a
+            // SQL page still ordered by `fi.updated_at` would be re-ordered
+            // on a different clock the moment content hits were blended in.
+            SearchOrderBy::ModifiedAt => "fi.content_modified_at",
+            SearchOrderBy::CreatedAt => "fi.created_at",
+            SearchOrderBy::Size => "fi.size",
+            // `relevance` has no dedicated column here — the
+            // recursive/non-recursive services blend in content-index
+            // hits and re-sort in memory. Falling back to name keeps the
+            // SQL page stable. §7: named explicitly, so a new axis is a
+            // compile error that must choose its own column.
+            SearchOrderBy::Relevance => "fi.name",
         };
         let order_dir = if criteria.reverse { "DESC" } else { "ASC" };
 
@@ -1577,7 +1634,7 @@ impl FileReadPort for FileBlobReadRepository {
             "SELECT fi.id, fi.name, fi.folder_id, fo.path, \
                     fi.size, fi.mime_type, \
                     EXTRACT(EPOCH FROM fi.created_at)::bigint, \
-                    EXTRACT(EPOCH FROM fi.updated_at)::bigint, \
+                    EXTRACT(EPOCH FROM fi.content_modified_at)::bigint, \
                     fi.blob_hash, \
                     \
                     fi.created_by, fi.updated_by, \
@@ -1681,7 +1738,7 @@ impl FileReadPort for FileBlobReadRepository {
                 SELECT fi.id, fi.name, fi.folder_id, fo.path,
                        fi.size, fi.mime_type,
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
-                       EXTRACT(EPOCH FROM fi.updated_at)::bigint,
+                       EXTRACT(EPOCH FROM fi.content_modified_at)::bigint,
                        fi.blob_hash,
 
                    fi.created_by, fi.updated_by
@@ -1713,7 +1770,7 @@ impl FileReadPort for FileBlobReadRepository {
                 SELECT fi.id, fi.name, fi.folder_id, fo.path,
                        fi.size, fi.mime_type,
                        EXTRACT(EPOCH FROM fi.created_at)::bigint,
-                       EXTRACT(EPOCH FROM fi.updated_at)::bigint,
+                       EXTRACT(EPOCH FROM fi.content_modified_at)::bigint,
                        fi.blob_hash,
 
                    fi.created_by, fi.updated_by

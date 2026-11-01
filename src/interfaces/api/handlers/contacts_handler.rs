@@ -105,13 +105,13 @@ pub struct UpdateContactRequest {
 
 /// Request body for creating or renaming a group.
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct GroupNameRequest {
+pub struct ContactGroupNameRequest {
     pub name: String,
 }
 
 /// Request body for adding a contact to a group.
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct AddMemberRequest {
+pub struct AddContactToGroupRequest {
     pub contact_id: String,
 }
 
@@ -464,6 +464,7 @@ pub async fn delete_address_book(
         ("book_id" = String, Path, description = "Address book UUID or \"system\""),
         ("limit"   = Option<i64>, Query, description = "Max results (omit for the full book; system book defaults to 100)"),
         ("offset"  = Option<i64>, Query, description = "Pagination offset (omit for none; system book defaults to 0)"),
+        ("include_self" = Option<bool>, Query, description = "System address book only — include the calling user in the results. Default false (the share-modal \"can't share with yourself\" rule); the admin drive-owner surface sets it true. Ignored for non-system books"),
     ),
     responses(
         (status = 200, body = Vec<ContactDto>, description = "List of contacts"),
@@ -850,7 +851,7 @@ pub async fn create_group(
     State(state): State<ContactsApiState>,
     auth_user: AuthUser,
     Path(book_id): Path<String>,
-    Json(body): Json<GroupNameRequest>,
+    Json(body): Json<ContactGroupNameRequest>,
 ) -> impl IntoResponse {
     if book_id == SYSTEM_BOOK_ID {
         return system_book_readonly();
@@ -930,7 +931,7 @@ pub async fn update_group(
     State(state): State<ContactsApiState>,
     auth_user: AuthUser,
     Path((book_id, group_id)): Path<(String, String)>,
-    Json(body): Json<GroupNameRequest>,
+    Json(body): Json<ContactGroupNameRequest>,
 ) -> impl IntoResponse {
     if book_id == SYSTEM_BOOK_ID {
         return system_book_readonly();
@@ -1049,7 +1050,7 @@ pub async fn add_contact_to_group(
     State(state): State<ContactsApiState>,
     auth_user: AuthUser,
     Path((book_id, group_id)): Path<(String, String)>,
-    Json(body): Json<AddMemberRequest>,
+    Json(body): Json<AddContactToGroupRequest>,
 ) -> impl IntoResponse {
     if book_id == SYSTEM_BOOK_ID {
         return system_book_readonly();

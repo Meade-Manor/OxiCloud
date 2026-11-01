@@ -9,9 +9,7 @@ use std::sync::Arc;
 use tracing::info;
 use utoipa::ToSchema;
 
-use crate::application::dtos::display_helpers::{
-    classify_display, format_file_size, intern_display, intern_mime,
-};
+use crate::application::dtos::display_helpers::{ResourceCategory, category_for, intern_mime};
 use crate::application::dtos::favorites_dto::{
     FavoritesResourceItemDto, FavoritesResourcesDto, FavoritesResourcesQuery,
 };
@@ -172,7 +170,7 @@ pub async fn list_favorites_resources(
 ) -> impl IntoResponse {
     let user_id = auth_user.id;
 
-    let order_by = q.order_by.as_deref().unwrap_or("name").to_owned();
+    let order_by = q.order_by.unwrap_or_default();
 
     // Capture the raw cursor-input string before `q` moves into the
     // decode step — the ETag mixes it in so pagination round-trips
@@ -192,7 +190,7 @@ pub async fn list_favorites_resources(
             user_id,
             limit,
             cursor,
-            &order_by,
+            order_by,
             kinds.as_deref(),
             q.reverse,
         )
@@ -221,10 +219,13 @@ pub async fn list_favorites_resources(
                             drive_id: row.drive_id,
                             created_at: row.resource_created_at,
                             modified_at: row.modified_at,
-                            is_root: false,
-                            icon_class: intern_display("fas fa-folder"),
-                            icon_special_class: intern_display("folder-icon"),
-                            category: intern_display("Folder"),
+                            // The favorites listing carries no subtree
+                            // rollup, and it is a REST surface that never
+                            // emits `D:getlastmodified`, so the row's own
+                            // mtime stands in rather than a claim about
+                            // descendants.
+                            tree_modified_at: row.modified_at,
+                            category: ResourceCategory::Folder,
                             created_by: row.created_by,
                             updated_by: row.updated_by,
                             // Every row on this listing is a favorite by
@@ -254,12 +255,9 @@ pub async fn list_favorites_resources(
                         let etag =
                             File::etag_for_listing(row.blob_hash.as_deref(), row.modified_at);
                         let content_hash = row.blob_hash.unwrap_or_default();
-                        // Name-derived display classes borrow `row.name`;
-                        // compute them before the name moves into the DTO.
-                        let classes = classify_display(&row.name, mime);
-                        let icon_class = intern_display(classes.icon_class);
-                        let icon_special_class = intern_display(classes.icon_special_class);
-                        let category = intern_display(classes.category);
+                        // The name-derived category borrows `row.name`;
+                        // compute it before the name moves into the DTO.
+                        let category = category_for(&row.name, mime);
                         let dto = FileDto {
                             id: row.resource_id.to_string(),
                             name: row.name,
@@ -269,10 +267,7 @@ pub async fn list_favorites_resources(
                             folder_id: row.parent_id.map(|u| u.to_string()),
                             created_at: row.resource_created_at,
                             modified_at: row.modified_at,
-                            icon_class,
-                            icon_special_class,
                             category,
-                            size_formatted: format_file_size(size_bytes),
                             content_hash,
                             etag,
                             created_by: row.created_by,

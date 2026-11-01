@@ -17,15 +17,21 @@ beforeEach(() => {
 it('builds search requests including filters', async () => {
 	await searchResources('q', {
 		recursive: true,
-		fileTypes: ['mp3', 'wav'],
+		typeFilter: 'audio',
 		minSize: 1,
 		maxSize: 9,
-		sortBy: 'updated_at'
+		sortBy: 'modified_at'
 	}).catch(() => {});
-	expect(j).toHaveBeenCalledWith(expect.stringContaining('type=mp3%2Cwav'), expect.anything());
+	// One category token, not a comma-joined extension list. The server
+	// classifies from mime via the indexed `category_order`, so the SPA no
+	// longer ships a per-category extension table that could miss a format.
+	expect(j).toHaveBeenCalledWith(expect.stringContaining('type=audio'), expect.anything());
 	// Sort dimension is sent on the wire as `order_by`, matching the
 	// backend's `SearchResourcesQuery` (post-normalization).
-	expect(j).toHaveBeenCalledWith(expect.stringContaining('order_by=updated_at'), expect.anything());
+	expect(j).toHaveBeenCalledWith(
+		expect.stringContaining('order_by=modified_at'),
+		expect.anything()
+	);
 	await searchSuggest('q').catch(() => {});
 	await clearSearchCache().catch(() => {});
 	expect(f.mock.calls.length + j.mock.calls.length).toBeGreaterThan(1);

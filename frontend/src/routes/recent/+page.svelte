@@ -7,20 +7,34 @@
 	import { onMount } from 'svelte';
 	import { SvelteMap } from 'svelte/reactivity';
 	import { primeContextPage } from '$lib/utils/listContext';
+	// Phase 4 — recent/* operations ride the generated SDK directly.
+	// `listRecentResources` returns `CursorListResponse` whose `items`
+	// is typed as `Array<OutgoingResourceItemDto>` due to a utoipa
+	// generic-specialization quirk on the Rust side; the real items
+	// are `RecentResourceItemDto`. One cast at the boundary.
+	//
+	// `RecentResourceItemDto.resource` is `FileDto | FolderDto | DriveDto`
+	// on the SDK (`ResourceContentDto`). Server-side invariant: a recent
+	// row only ever points at a file or a folder — drives aren't tracked.
+	// Tightening the type locally lets `.created_by` reads compile cleanly
+	// without per-site `'created_by' in resource` narrowing.
 	import {
-		clearRecent,
-		fetchRecentPage,
-		removeFromRecent,
-		type RecentResourceItem
-	} from '$lib/api/endpoints/recent';
-	import {
-		addFavorite,
-		dateBucket,
-		removeFavorite,
-		resolveOwnerName,
-		sizeBucket,
-		typeLabel
-	} from '$lib/api/endpoints/favorites';
+		clearRecentItems,
+		listRecentResources,
+		removeFromRecent
+	} from '$lib/api/generated/openapi/sdk.gen';
+	import type {
+		FileDto,
+		FolderDto,
+		RecentOrderBy,
+		RecentResourceItemDto
+	} from '$lib/api/generated/openapi/types.gen';
+	type RecentFileOrFolderItem = RecentResourceItemDto & {
+		resource: FileDto | FolderDto;
+	};
+	import { addFavorite, removeFavorite } from '$lib/api/endpoints/favorites';
+	import { dateBucket, sizeBucket, typeLabelOf } from '$lib/utils/resourceBuckets';
+	import { resolveOwnerName } from '$lib/utils/ownerName';
 	import { fileDownloadUrl, renameFile, deleteFile } from '$lib/api/endpoints/files';
 	import { renameFolder, deleteFolder } from '$lib/api/endpoints/folders';
 	import type { FileItem, FolderItem, ItemType } from '$lib/api/types';
@@ -41,7 +55,7 @@
 	import { t } from '$lib/i18n/index.svelte';
 	import Icon from '$lib/icons/Icon.svelte';
 
-	let raw = $state<RecentResourceItem[]>([]);
+	let raw = $state<RecentFileOrFolderItem[]>([]);
 	let cursor = $state<string | undefined>(undefined);
 	let loading = $state(false);
 	let error = $state<string | null>(null);
@@ -71,7 +85,9 @@
 		preferences.hideDotfiles ? items.filter((i) => isDotfile(i.name)).length : 0
 	);
 
-	const groupBys: GroupByDef[] = [
+	// §7: typed to the generated `RecentOrderBy` union, so a typo or a
+	// retired axis is an `npm run check` failure rather than a runtime 400.
+	const groupBys: GroupByDef<RecentOrderBy>[] = [
 		{ key: '', label: t('files.name', 'Name'), orderBy: 'name', icon: 'arrow-up-a-z' },
 		{
 			key: 'owner',
@@ -84,8 +100,8 @@
 			key: 'type',
 			label: t('groupby.type', 'Type'),
 			orderBy: 'type',
-			bucketOf: (item) => item.category ?? 'other',
-			labelOf: (k) => typeLabel(k)
+			bucketOf: (item) => item.category ?? 'Unknown',
+			labelOf: (k) => typeLabelOf(k)
 		},
 		{
 			key: 'size',
@@ -108,23 +124,30 @@
 	];
 
 	// Recent defaults to most-recently-accessed first (accessed_at DESC).
-	async function load(reset = false, orderBy = 'accessed_at', rev = reversed) {
+	async function load(reset = false, orderBy: RecentOrderBy = 'accessed_at', rev = reversed) {
 		loading = true;
 		error = null;
 		try {
-			const page = await fetchRecentPage({
-				cursor: reset ? undefined : cursor,
-				orderBy,
-				reverse: rev,
-				resourceTypes: ['file', 'folder']
+			const page = await listRecentResources({
+				throwOnError: true,
+				query: {
+					cursor: reset ? null : (cursor ?? null),
+					order_by: orderBy,
+					reverse: rev,
+					resource_types: 'file,folder',
+					limit: 50
+				}
 			});
-			raw = reset ? page.items : [...raw, ...page.items];
-			primeContextPage(contextMap, reset, page.items, (it) => [
+			// `CursorListResponse.items` carries the wrong concrete type
+			// on the SDK (utoipa generic-specialization quirk); cast once.
+			const items = page.items as unknown as RecentFileOrFolderItem[];
+			raw = reset ? items : [...raw, ...items];
+			primeContextPage(contextMap, reset, items, (it) => [
 				it.resource.id,
 				{ date: it.accessed_at, ownerId: it.resource.created_by ?? null }
 			]);
-			cursor = page.next_cursor;
-			void owners.resolve(page.items.map((i) => i.resource.created_by));
+			cursor = page.next_cursor ?? undefined;
+			void owners.resolve(items.map((i) => i.resource.created_by));
 		} catch (e) {
 			console.error('recent: load error', e);
 			error = t('errors_loadFailed', 'Failed to load items');
@@ -133,7 +156,7 @@
 		}
 	}
 
-	function orderByForGroup(): string {
+	function orderByForGroup(): RecentOrderBy {
 		return groupBys.find((g) => g.key === groupBy)?.orderBy ?? 'accessed_at';
 	}
 
@@ -183,7 +206,10 @@
 		raw = raw.filter((it) => it.resource.id !== item.id);
 		contextMap.delete(item.id);
 		try {
-			await removeFromRecent(kind, item.id);
+			await removeFromRecent({
+				throwOnError: true,
+				path: { item_type: kind, item_id: item.id }
+			});
 		} catch (e) {
 			raw = [...raw.slice(0, idx), snapshot, ...raw.slice(idx)];
 			contextMap.set(item.id, {
@@ -202,7 +228,7 @@
 		});
 		if (!ok) return;
 		try {
-			await clearRecent();
+			await clearRecentItems({ throwOnError: true });
 			raw = [];
 			cursor = undefined;
 		} catch (e) {
@@ -412,6 +438,9 @@
 	bind:reversed
 	onreload={(orderBy, rev) => {
 		cursor = undefined;
+		// §7 part 3g: `ResourceList` is generic over the axis now, so
+		// `orderBy` arrives already typed as `RecentOrderBy` — the
+		// `as RecentOrderBy` assertion that stood here is gone.
 		load(true, orderBy, rev);
 	}}
 >

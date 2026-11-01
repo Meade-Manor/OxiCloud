@@ -983,7 +983,28 @@ pub async fn update_profile(
     Ok((StatusCode::OK, Json(self_dto)))
 }
 
-// TODO: add utoipa
+/// Set or clear the current user's profile image.
+///
+/// Body carries an image reference as either an HTTPS URL or a
+/// data: URI (`data:image/png;base64,…`); `null` clears the stored
+/// value and the SPA falls back to the initials-avatar renderer.
+/// Validation (size cap, MIME allowlist, URL scheme) is enforced in
+/// `AuthApplicationService::update_user_image`.
+///
+/// Response is an empty 200 — the SPA re-fetches `GET /me` on the
+/// next session.load tick to pick up the new avatar reference.
+#[utoipa::path(
+    put,
+    path = "/api/auth/me/image",
+    request_body = UpdateUserImageDto,
+    responses(
+        (status = 200, description = "Image updated (or cleared when `image` was null)"),
+        (status = 400, description = "Validation error (invalid data URI / unsupported MIME / oversized / malformed URL)"),
+        (status = 401, description = "Not authenticated"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "auth"
+)]
 pub async fn update_user_image(
     State(state): State<Arc<AppState>>,
     CurrentUserId(user_id): CurrentUserId,
@@ -1358,7 +1379,7 @@ pub async fn setup_admin(
 
 /// System initialisation state, returned by `GET /api/auth/status`.
 #[derive(serde::Serialize, ToSchema)]
-pub struct SystemStatus {
+pub struct SystemInitStatusDto {
     /// Whether the system has been set up with an admin.
     initialized: bool,
     /// Number of admin users in the system.
@@ -1374,7 +1395,7 @@ pub struct SystemStatus {
     get,
     path = "/api/auth/status",
     responses(
-        (status = 200, description = "System status", body = SystemStatus),
+        (status = 200, description = "System status", body = SystemInitStatusDto),
         (status = 503, description = "Auth service not configured"),
     ),
     tag = "auth"
@@ -1401,7 +1422,7 @@ pub async fn get_system_status(
         .await
         .unwrap_or(0);
 
-    let status = SystemStatus {
+    let status = SystemInitStatusDto {
         initialized: db_initialized || admin_count > 0,
         admin_count,
         registration_allowed: db_initialized || admin_count > 0,

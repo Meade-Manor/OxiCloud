@@ -1626,6 +1626,31 @@ impl AuthMethod {
     }
 }
 
+/// Pure boolean decision for the boot-time "magic-link login is
+/// muted by OIDC-master" warning. Extracted so the 2×2 truth table
+/// can be pinned with a trivial unit test — no env-var mocking.
+///
+/// Inputs:
+///   * `allowed_methods` — the FINAL resolved allowlist (post-env
+///     parsing). Catches both explicit `AUTH_METHODS=…,magic_link,…`
+///     and the implicit default `[Password, MagicLink]` deployed on
+///     top of OIDC.
+///   * `oidc_env_enabled` — the parsed `OXICLOUD_OIDC_ENABLED` env
+///     var. Does NOT cover admin-panel-only OIDC enablement — see
+///     the call site's doc for the known gap.
+///
+/// Returns `true` iff the operator has configured a deployment where
+/// `magic_link` is in the allowlist AND OIDC is on at the env level,
+/// meaning `is_magic_link_login_allowed()` will return `false` at
+/// runtime via the OIDC-master rule — a mute the operator deserves
+/// to see called out at boot.
+pub(crate) fn should_warn_magic_link_muted_by_oidc(
+    allowed_methods: &[AuthMethod],
+    oidc_env_enabled: bool,
+) -> bool {
+    oidc_env_enabled && allowed_methods.contains(&AuthMethod::MagicLink)
+}
+
 /// Additive auth-policy switches. Exposed as `AuthConfig::auth_policies`
 /// and parsed from `OXICLOUD_AUTH_POLICIES` (comma-separated). Each
 /// variant's name states its own polarity — `Permit...` grants an
@@ -2471,6 +2496,49 @@ pub struct FeaturesConfig {
     /// Env: `OXICLOUD_ENABLE_MARKDOWN_COLLAB` (default `true`).
     pub enable_markdown_collab: bool,
 
+    /// Shared-worker bus — one `/api/rt/ws` per BROWSER instead of
+    /// one per tab.
+    ///
+    /// When `true`, the SPA attempts a `SharedWorker` + handshake
+    /// probe at boot. On success, every tab in the same browser
+    /// multiplexes topic subscriptions, binary collab frames, and
+    /// JSON-RPC calls through one shared WebSocket. On failure
+    /// (Safari < 16.4, enterprise CSP, iOS PWA quirks, 1 s
+    /// handshake timeout) the SPA silently falls back to the per-
+    /// tab client. The fallback is tested in Gate 2a's Vitest and
+    /// cannot be disabled.
+    ///
+    /// When `false`, the SPA skips the detection + handshake and
+    /// goes straight to the per-tab client — one WS per tab, same
+    /// as before the shared-worker migration. Operators choose this
+    /// explicitly: a specific instance where the SharedWorker is
+    /// known to misbehave, or a workaround for an in-the-wild
+    /// regression while the FE is still shipping fixes.
+    ///
+    /// **Default: `false` (opt-in).** The feature exists to reduce
+    /// WS fan-out at scale (10k users × multiple tabs → 10k WS,
+    /// not 50k+), but it is in an observation phase while production
+    /// behaviour across browsers, extensions and tab-lifecycle quirks
+    /// is still being gathered. Operators who want the fan-out
+    /// reduction today opt in explicitly; everyone else gets the
+    /// per-tab mode that has been in the field longest.
+    ///
+    /// The flip-direction trade-off is deliberate: on-by-default
+    /// would reach the fan-out goal sooner but surfaces any
+    /// shared-worker edge case on every operator at once. Off-by-
+    /// default means the win is unrealised until each operator
+    /// turns it on, and the mandatory handshake-tested fallback
+    /// still bounds the blast radius for browsers that can't run
+    /// shared mode (Safari < 16.4, enterprise CSP, iOS PWA).
+    ///
+    /// Server-side wire shape is identical in both modes. The flag
+    /// gates FE behaviour only; `/api/rt/ws` + `/api/rt/ticket` are
+    /// still registered (gated by `enable_message_bus`).
+    ///
+    /// Env: `OXICLOUD_ENABLE_SHARED_WORKER_BUS` (default `false`).
+    /// See `docs/plan/message-bus-via-shared-worker.md`.
+    pub enable_shared_worker_bus: bool,
+
     /// Background purge of expired `storage.role_grants` rows.
     ///
     /// The AuthZ engine already filters expired grants out of every
@@ -2969,6 +3037,15 @@ impl Default for FeaturesConfig {
             // pair can only be inconsistent through an explicit
             // operator override.
             enable_markdown_collab: true,
+            // Shared-worker bus — OFF by default (opt-in). See the
+            // field docstring: the fan-out reduction win is real, but
+            // production behaviour across browsers, extensions and
+            // tab-lifecycle quirks is still being observed. Operators
+            // who want the win today set
+            // OXICLOUD_ENABLE_SHARED_WORKER_BUS=true and restart; the
+            // mandatory handshake-tested fallback bounds blast radius
+            // on any browser that can't run shared mode.
+            enable_shared_worker_bus: false,
             grant_cleanup: GrantCleanupConfig::default(),
             notifications_retention_days: 30, // 30 days is the plan's default
         }
@@ -3970,6 +4047,55 @@ impl AppConfig {
             config.auth.allowed_auth_methods = methods;
         }
 
+        // Cross-validation C: `magic_link` is in the effective allowlist
+        // AND `OXICLOUD_OIDC_ENABLED=true` → magic-link LOGIN is muted by
+        // the OIDC-master rule in `is_magic_link_login_allowed()` (the
+        // IdP is the security boundary; magic-link would sidestep any
+        // 2FA / step-up the IdP enforces). The operator either wrote
+        // `magic_link` into `AUTH_METHODS` and is unaware OIDC overrides
+        // them, or they left `AUTH_METHODS` unset and the default
+        // allowlist (`[Password, MagicLink]`) carries it in by implication.
+        // In either case the muted method is invisible to the operator
+        // until a user notices magic-link login doesn't work — surface
+        // it at boot instead.
+        //
+        // Scope: env var only. If OIDC is enabled later via admin panel
+        // (`state.config = Some(...)` after boot), this check doesn't
+        // observe it — a sibling runtime warning near the DI factory's
+        // `with_oidc(…)` call would be the right place to catch that
+        // case. Documented gap; worth a follow-up if operators configure
+        // OIDC exclusively via admin panel.
+        //
+        // The admin-mediated invite path (resource-scoped magic-link
+        // tokens, `resource_kind().is_some()` at redemption time) is
+        // intentionally NOT muted by this rule — see
+        // `auth_application_service.rs::redeem_magic_link` and
+        // `docs/config/authentication.md § 'OIDC master rule'`.
+        {
+            let oidc_env_enabled = env::var("OXICLOUD_OIDC_ENABLED")
+                .ok()
+                .and_then(|s| s.parse::<bool>().ok())
+                .unwrap_or(false);
+            if should_warn_magic_link_muted_by_oidc(
+                &config.auth.allowed_auth_methods,
+                oidc_env_enabled,
+            ) {
+                tracing::warn!(
+                    target: "oxicloud::config",
+                    reason = "oidc_master_mutes_magic_link",
+                    "OXICLOUD_AUTH_METHODS effective allowlist contains 'magic_link' \
+                     but OXICLOUD_OIDC_ENABLED=true — magic-link LOGIN is muted by \
+                     the OIDC-master rule (the IdP is the security boundary; \
+                     magic-link would bypass any 2FA / step-up it enforces). \
+                     The admin-mediated invite path still works. To resolve the \
+                     inconsistency: drop 'magic_link' from OXICLOUD_AUTH_METHODS \
+                     (e.g. set OXICLOUD_AUTH_METHODS=password,oidc), or set \
+                     OXICLOUD_OIDC_ENABLED=false if magic-link login was the \
+                     intent. See docs/config/authentication.md § 'OIDC master rule'."
+                );
+            }
+        }
+
         // Legacy alias: OXICLOUD_OIDC_DISABLE_PASSWORD_LOGIN=true still
         // removes Password from the allowlist. Its main handling in the
         // OIDC config block below is preserved for the `login_options`
@@ -4140,6 +4266,20 @@ impl AppConfig {
                  socket to route Yjs frames on. Either enable the message bus \
                  or disable markdown collab."
             );
+        }
+
+        // Shared-worker bus — see the field docstring for the
+        // opt-out rationale. The flag only gates FE behaviour (one
+        // WS per browser vs. one per tab); the server-side WS
+        // endpoint is always available when `enable_message_bus`
+        // is on. No cross-flag panic — if the message bus itself
+        // is off, this flag is naturally a no-op (the FE sees
+        // `message_bus: false` first and skips WS setup entirely).
+        if let Ok(enable_shared_worker_bus) =
+            env::var("OXICLOUD_ENABLE_SHARED_WORKER_BUS").map(|v| v.parse::<bool>())
+            && let Ok(val) = enable_shared_worker_bus
+        {
+            config.features.enable_shared_worker_bus = val;
         }
 
         // Slice E — notification retention. Read as u32 so a
@@ -6063,6 +6203,142 @@ mod tests {
             // for this straightforward truth table).
             let magic_only = auth_with_methods(vec![AuthMethod::MagicLink]);
             assert_eq!(opaque.effective_mode(&magic_only), OpaqueMode::Off);
+        }
+    }
+}
+
+/// Truth-table for the boot-time "magic-link login muted by OIDC"
+/// warning composed via the pure
+/// [`super::should_warn_magic_link_muted_by_oidc`] helper.
+///
+/// Pinned against the free function (not the warning emit site) so
+/// the matrix pins without env-var mocking or tracing capture. The
+/// warning emit site's only responsibility is to source the two
+/// inputs (`config.auth.allowed_auth_methods` + the parsed
+/// `OXICLOUD_OIDC_ENABLED`) correctly; the decision itself is a
+/// pure AND of membership and a boolean.
+///
+/// Regression this file pins (2026-10-16): operators running
+/// `AUTH_METHODS=password,magic_link,oidc` + `OIDC_ENABLED=true`,
+/// or the default allowlist + `OIDC_ENABLED=true`, were seeing
+/// `magic_link_login_enabled: false` on the wire with no boot
+/// signal explaining why. This helper + the companion warning emit
+/// at config.rs~3998 close that silent-mute gap.
+#[cfg(test)]
+mod should_warn_magic_link_muted_by_oidc_tests {
+    use super::{AuthMethod, should_warn_magic_link_muted_by_oidc};
+
+    #[test]
+    fn no_warning_when_oidc_disabled() {
+        // ① OIDC off — regardless of allowlist, nothing to warn
+        //    about (the OIDC-master rule never fires).
+        for methods in [
+            vec![],
+            vec![AuthMethod::MagicLink],
+            vec![AuthMethod::Password, AuthMethod::MagicLink],
+            vec![AuthMethod::Password],
+            vec![AuthMethod::MagicLink, AuthMethod::Oidc],
+        ] {
+            assert!(
+                !should_warn_magic_link_muted_by_oidc(&methods, false),
+                "expected NO warning for methods={methods:?}, oidc_env_enabled=false"
+            );
+        }
+    }
+
+    #[test]
+    fn no_warning_when_magic_link_not_in_allowlist() {
+        // ② OIDC on but operator explicitly dropped magic_link
+        //    (e.g. AUTH_METHODS=password,oidc or AUTH_METHODS=oidc).
+        //    The allowlist is already consistent with the OIDC-
+        //    master rule — nothing to warn about.
+        assert!(!should_warn_magic_link_muted_by_oidc(
+            &[AuthMethod::Password, AuthMethod::Oidc],
+            true
+        ));
+        assert!(!should_warn_magic_link_muted_by_oidc(
+            &[AuthMethod::Oidc],
+            true
+        ));
+        assert!(!should_warn_magic_link_muted_by_oidc(
+            &[AuthMethod::Password],
+            true
+        ));
+    }
+
+    #[test]
+    fn warns_on_explicit_magic_link_plus_oidc() {
+        // ③ The headline case: operator wrote `magic_link` into
+        //    `AUTH_METHODS` while OIDC is on, expecting both to
+        //    serve. OIDC-master mutes magic-link login silently —
+        //    warning MUST fire.
+        assert!(should_warn_magic_link_muted_by_oidc(
+            &[
+                AuthMethod::Password,
+                AuthMethod::MagicLink,
+                AuthMethod::Oidc
+            ],
+            true
+        ));
+        assert!(should_warn_magic_link_muted_by_oidc(
+            &[AuthMethod::MagicLink, AuthMethod::Oidc],
+            true
+        ));
+        assert!(should_warn_magic_link_muted_by_oidc(
+            &[AuthMethod::Password, AuthMethod::MagicLink],
+            true
+        ));
+        assert!(should_warn_magic_link_muted_by_oidc(
+            &[AuthMethod::MagicLink],
+            true
+        ));
+    }
+
+    #[test]
+    fn warns_on_default_allowlist_plus_oidc() {
+        // ④ Operator left `AUTH_METHODS` unset — the default
+        //    allowlist is `[Password, MagicLink]`. They turned OIDC
+        //    on without touching the auth-methods var. Magic-link
+        //    login is silently muted — operator deserves the same
+        //    boot signal as the explicit case ③. (The emit site
+        //    uses the FINAL `config.auth.allowed_auth_methods`
+        //    which carries the default when unset, so this path is
+        //    exercised the same way.)
+        let default_allowlist = vec![AuthMethod::Password, AuthMethod::MagicLink];
+        assert!(should_warn_magic_link_muted_by_oidc(
+            &default_allowlist,
+            true
+        ));
+    }
+
+    #[test]
+    fn full_truth_table() {
+        // Belt-and-braces: enumerate (oidc_enabled, magic_link_in_methods)
+        // combined with a representative set of methods vectors, and
+        // assert the decision equals the pure AND.
+        let allowlists: &[&[AuthMethod]] = &[
+            &[],
+            &[AuthMethod::Password],
+            &[AuthMethod::MagicLink],
+            &[AuthMethod::Oidc],
+            &[AuthMethod::Password, AuthMethod::MagicLink],
+            &[AuthMethod::Password, AuthMethod::Oidc],
+            &[AuthMethod::MagicLink, AuthMethod::Oidc],
+            &[
+                AuthMethod::Password,
+                AuthMethod::MagicLink,
+                AuthMethod::Oidc,
+            ],
+        ];
+        for &allowlist in allowlists {
+            for oidc in [false, true] {
+                let expected = oidc && allowlist.contains(&AuthMethod::MagicLink);
+                assert_eq!(
+                    should_warn_magic_link_muted_by_oidc(allowlist, oidc),
+                    expected,
+                    "mismatch at (allowlist={allowlist:?}, oidc_env_enabled={oidc})"
+                );
+            }
         }
     }
 }

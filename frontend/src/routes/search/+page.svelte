@@ -13,13 +13,14 @@
 	import { searchResources } from '$lib/api/endpoints/search';
 	import { fileDownloadUrl, renameFile, deleteFile } from '$lib/api/endpoints/files';
 	import { renameFolder, deleteFolder } from '$lib/api/endpoints/folders';
-	import {
-		addFavorite,
-		removeFavorite,
-		dateBucket,
-		sizeBucket
-	} from '$lib/api/endpoints/favorites';
-	import type { FileItem, FolderItem, SearchResourceItem, SortBy } from '$lib/api/types';
+	import { addFavorite, removeFavorite } from '$lib/api/endpoints/favorites';
+	import { dateBucket, sizeBucket } from '$lib/utils/resourceBuckets';
+	import type { FileItem, FolderItem } from '$lib/api/types';
+	import type {
+		SearchOrderBy,
+		SearchResourceItem,
+		SearchTypeFilter
+	} from '$lib/api/generated/openapi/types.gen';
 	import { lazyComponent } from '$lib/composables/lazyComponent.svelte';
 	import { folderAccessCached, probeFolderAccess } from '$lib/utils/folderAccess';
 	import Icon from '$lib/icons/Icon.svelte';
@@ -151,40 +152,40 @@
 	}
 
 	// Filters
-	type TypeKey = 'all' | 'image' | 'video' | 'document' | 'audio' | 'archive';
+	// Typed off the generated union, so a token the server would reject is a
+	// `npm run check` failure rather than a runtime 400. `other` is accepted
+	// by the API but deliberately not offered in the picker — it is an
+	// operator affordance for files whose mime was never detected.
+	type TypeKey = Exclude<SearchTypeFilter, 'other'>;
 	type SizeKey = 'all' | 'small' | 'medium' | 'large';
 	type DateKey = 'all' | 'day' | 'week' | 'month' | 'year';
 	let typeFilter = $state<TypeKey>('all');
 	let sizeFilter = $state<SizeKey>('all');
 	let dateFilter = $state<DateKey>('all');
 
-	const TYPE_EXT: Record<Exclude<TypeKey, 'all'>, string[]> = {
-		image: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'heic', 'avif', 'tiff'],
-		video: ['mp4', 'mov', 'mkv', 'avi', 'webm', 'm4v', 'wmv', 'flv'],
-		document: [
-			'pdf',
-			'doc',
-			'docx',
-			'xls',
-			'xlsx',
-			'ppt',
-			'pptx',
-			'txt',
-			'md',
-			'odt',
-			'rtf',
-			'csv'
-		],
-		audio: ['mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a', 'opus'],
-		archive: ['zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz']
-	};
+	// `TYPE_EXT` lived here: a per-category extension list (12 image, 7 audio,
+	// …) that this SPA sent as `type=mp3,wav,flac,…`. Deleted — the server now
+	// classifies from `mime_type` against the indexed
+	// `storage.files.category_order`. Three defects went with it: an extension
+	// we forgot to list dropped the file from its own category, a file with no
+	// extension could never match anything, and folders were never filtered.
 	const TYPES: { v: TypeKey; l: string }[] = [
 		{ v: 'all', l: t('search.type.all', 'All types') },
+		// The option that fixes the reported defect. Before this, folders were
+		// returned by EVERY filter because `search_folders` cannot narrow by
+		// type — so picking "Images" still listed matching folders. Now a
+		// non-folder filter skips the folder query entirely, and this value
+		// inverts it.
+		{ v: 'folder', l: t('search.type.folder', 'Folders') },
 		{ v: 'image', l: t('search.type.image', 'Images') },
 		{ v: 'video', l: t('search.type.video', 'Videos') },
 		{ v: 'document', l: t('search.type.document', 'Documents') },
 		{ v: 'audio', l: t('search.type.audio', 'Audio') },
-		{ v: 'archive', l: t('search.type.archive', 'Archives') }
+		{ v: 'archive', l: t('search.type.archive', 'Archives') },
+		// Category 900 — json/js/ts/html/sql/py/rust/… The server has always
+		// classified these; the picker simply never offered the filter, so
+		// `TypeKey` accepted a value no affordance could produce.
+		{ v: 'code', l: t('search.type.code', 'Code') }
 	];
 	const SIZES: { v: SizeKey; l: string }[] = [
 		{ v: 'all', l: t('search.size.all', 'Any size') },
@@ -247,7 +248,10 @@
 	// `orderBy` values map 1:1 to the backend `SearchResourcesQuery.order_by`.
 	// The asc/desc button binds to `reversed` and passes through to the
 	// backend `reverse` flag.
-	const groupBys: GroupByDef[] = [
+	// §7 part 3g: typed to the generated `SearchOrderBy` — `relevance` is
+	// unique to this endpoint, and part 3e proved how easily a dead axis
+	// spelling survives when nothing checks it.
+	const groupBys: GroupByDef<SearchOrderBy>[] = [
 		{
 			key: '',
 			label: t('search.sort.relevance', 'Relevance'),
@@ -264,7 +268,7 @@
 		{
 			key: 'modifiedAt',
 			label: t('groupby.modifiedAt', 'Modified date'),
-			orderBy: 'updated_at',
+			orderBy: 'modified_at',
 			bucketOf: (item) => dateBucket(item.modified_at)
 		},
 		{
@@ -275,7 +279,7 @@
 		}
 	];
 
-	function orderByForGroup(): string {
+	function orderByForGroup(): SearchOrderBy {
 		return groupBys.find((g) => g.key === groupBy)?.orderBy ?? 'relevance';
 	}
 
@@ -301,10 +305,12 @@
 				: undefined;
 		return {
 			recursive: true,
-			sortBy: orderByForGroup() as SortBy,
+			// §7 part 3g: `orderByForGroup` returns `SearchOrderBy` now, so the
+			// `as SortBy` assertion that stood here is gone.
+			sortBy: orderByForGroup(),
 			reverse: reversed,
 			folderId,
-			fileTypes: typeFilter === 'all' ? undefined : TYPE_EXT[typeFilter],
+			typeFilter,
 			...sizeBounds(sizeFilter),
 			modifiedAfter: dateBound(dateFilter)
 		};

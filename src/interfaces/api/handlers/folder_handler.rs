@@ -6,10 +6,7 @@ use axum::{
 };
 use std::sync::Arc;
 
-use crate::application::dtos::display_helpers::{
-    category_for, classify_display, format_file_size, icon_class_for, icon_special_class_for,
-    intern_display, intern_mime,
-};
+use crate::application::dtos::display_helpers::{ResourceCategory, category_for, intern_mime};
 use crate::application::dtos::file_dto::FileDto;
 use crate::application::dtos::folder_dto::{
     AncestorsQuery, CreateFolderDto, FolderAncestorsDto, FolderDto, FolderResourceItemDto,
@@ -603,7 +600,7 @@ pub async fn list_folder_resources(
         Err(err) => return AppError::from(err).into_response(),
     };
 
-    let order_by = q.order_by.clone().unwrap_or_else(|| "name".to_owned());
+    let order_by = q.order_by.unwrap_or_default();
     let kinds = q.resource_kinds();
     // Snapshot cursor + limit for the shared ETag engine (§2).
     let cursor_input = q.cursor.clone();
@@ -611,7 +608,7 @@ pub async fn list_folder_resources(
     let opts = ListResourcesOptions {
         limit,
         cursor: q.decode_cursor(),
-        order_by: &order_by,
+        order_by,
         kinds: kinds.as_deref(),
         reverse: q.reverse,
     };
@@ -676,10 +673,12 @@ pub async fn list_folder_resources(
                             drive_id: row.drive_id,
                             created_at: row.created_at,
                             modified_at: row.modified_at,
-                            is_root: false,
-                            icon_class: intern_display("fas fa-folder"),
-                            icon_special_class: intern_display("folder-icon"),
-                            category: intern_display("Folder"),
+                            // The share-recipient listing carries no subtree
+                            // rollup, and it is a REST surface that never
+                            // emits `D:getlastmodified`, so the row's own
+                            // mtime stands in.
+                            tree_modified_at: row.modified_at,
+                            category: ResourceCategory::Folder,
                             created_by: row.created_by,
                             updated_by: row.updated_by,
                             is_favorite: row.is_favorite,
@@ -709,14 +708,11 @@ pub async fn list_folder_resources(
                         let etag =
                             File::etag_for_listing(row.blob_hash.as_deref(), row.modified_at);
                         let content_hash = row.blob_hash.unwrap_or_default();
-                        // Compute the name-derived icon/category classes first
-                        // (they borrow `&row.name`), so `name` can be moved into
-                        // the DTO below instead of cloned — one fewer String
-                        // alloc per file row (benches/ROUND7.md).
-                        let classes = classify_display(&row.name, mime);
-                        let icon_class = intern_display(classes.icon_class);
-                        let icon_special_class = intern_display(classes.icon_special_class);
-                        let category = intern_display(classes.category);
+                        // Compute the name-derived category first (it borrows
+                        // `&row.name`), so `name` can be moved into the DTO
+                        // below instead of cloned — one fewer String alloc per
+                        // file row (benches/ROUND7.md).
+                        let category = category_for(&row.name, mime);
                         let dto = FileDto {
                             id: row.id.to_string(),
                             name: row.name,
@@ -726,10 +722,7 @@ pub async fn list_folder_resources(
                             folder_id: row.parent_id.map(|u| u.to_string()),
                             created_at: row.created_at,
                             modified_at: row.modified_at,
-                            icon_class,
-                            icon_special_class,
                             category,
-                            size_formatted: format_file_size(size_bytes),
                             content_hash,
                             etag,
                             created_by: row.created_by,
@@ -822,10 +815,10 @@ fn mount_entry_to_item(
             drive_id: cfg.drive_id,
             created_at: epoch_to_datetime(entry.created_at),
             modified_at: epoch_to_datetime(entry.modified_at),
-            is_root: false,
-            icon_class: Arc::from("fas fa-folder"),
-            icon_special_class: Arc::from("folder-icon"),
-            category: Arc::from("Folder"),
+            // External mount entry — no subtree rollup available. See
+            // `mount_dto::mount_folder_dto`.
+            tree_modified_at: epoch_to_datetime(entry.modified_at),
+            category: ResourceCategory::Folder,
             created_by: Some(cfg.owner_id),
             updated_by: Some(cfg.owner_id),
             // Mount entries use synthetic `ext:*` ids — no favorites /
@@ -850,10 +843,7 @@ fn mount_entry_to_item(
             folder_id: Some(parent_id.to_owned()),
             created_at: epoch_to_datetime(entry.created_at),
             modified_at: epoch_to_datetime(entry.modified_at),
-            icon_class: Arc::from(icon_class_for(&entry.name, &mime)),
-            icon_special_class: Arc::from(icon_special_class_for(&entry.name, &mime)),
-            category: Arc::from(category_for(&entry.name, &mime)),
-            size_formatted: format_file_size(entry.size),
+            category: category_for(&entry.name, &mime),
             content_hash: String::new(),
             etag: virtual_file_etag(entry.size, entry.modified_at),
             created_by: Some(cfg.owner_id),
@@ -919,7 +909,9 @@ mod mount_mapping_tests {
         assert_eq!(dto.parent_id.as_deref(), Some(parent.as_str()));
         assert_eq!(dto.etag, virtual_folder_etag(1234));
         assert_eq!(dto.drive_id, cfg.drive_id);
-        assert!(!dto.is_root);
+        // `assert!(!dto.is_root)` stood here. The field is gone, and the
+        // `parent_id` assert four lines up is the same statement — `is_root`
+        // only ever meant `parent_id.is_none()`.
         // Hierarchy is intentionally cleared on this listing.
         assert_eq!(dto.path, "");
     }

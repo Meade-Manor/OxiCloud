@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use axum::extract::FromRequestParts;
+use oxicloud::application::dtos::display_helpers::ResourceCategory;
 use oxicloud::application::dtos::folder_dto::FolderDto;
 use oxicloud::interfaces::middleware::auth::CurrentUser;
 use oxicloud::interfaces::nextcloud::session::{NcSession, SharedNcSession};
@@ -108,11 +109,13 @@ fn fixture_folder() -> FolderDto {
         modified_at: oxicloud::application::dtos::timestamp_helpers::epoch_to_datetime(
             1_700_000_100,
         ),
-        is_root: true,
+        // Distinct from `modified_at`: this is the NC chroot fixture, and NC
+        // DAV sources a collection's `getlastmodified` from the rollup.
+        tree_modified_at: oxicloud::application::dtos::timestamp_helpers::epoch_to_datetime(
+            1_700_000_200,
+        ),
         etag: "8f2e5a1c9b3d4e6f".to_string(),
-        icon_class: Arc::from("fas fa-folder"),
-        icon_special_class: Arc::from("folder-icon"),
-        category: Arc::from("Folder"),
+        category: ResourceCategory::Folder,
         created_by: None,
         updated_by: None,
         is_favorite: false,

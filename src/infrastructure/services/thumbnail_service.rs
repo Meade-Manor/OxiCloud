@@ -140,9 +140,9 @@ impl ThumbnailCacheKey {
     }
 }
 
-/// Maximum pixel count before rejecting decode (50 megapixels → ~200 MB RGBA).
-/// Images above this are silently skipped — protects against single-image OOM.
-const MAX_DECODE_PIXELS: u64 = 50_000_000;
+/// Re-exported from `image_decode`, which is now the single home for the
+/// decode bound so the transcode and face-analysis paths share this policy.
+use crate::infrastructure::services::image_decode::MAX_DECODE_PIXELS;
 
 /// JPEG quality for the fallback codec.
 const JPEG_QUALITY: u8 = 80;
@@ -331,6 +331,21 @@ impl ThumbnailService {
     }
 
     /// Check if a file is an image that can have thumbnails
+    /// Whether a thumbnail can be rendered for this type.
+    ///
+    /// This list is not a policy choice — it mirrors the decoders actually
+    /// compiled in: `image = { features = ["jpeg", "png", "gif", "webp"] }`
+    /// in `Cargo.toml`. Keep the two in step; widening this alone turns a
+    /// clean skip into a decode error.
+    ///
+    /// **HEIF/HEIC and AVIF are absent deliberately.** The `image` crate
+    /// has no decoder for either, so iPhone photos get no thumbnail and no
+    /// tile in the Photos grid. Their EXIF *does* work — nom-exif parses
+    /// HEIF, so capture date and GPS come through — so the file is not
+    /// invisible, just un-previewed. Deferred pending a **pure-Rust**
+    /// decoder; `libheif-rs` was declined (C toolchain + LGPL). Full
+    /// reasoning and the two rejected alternatives:
+    /// `docs/plan/Photos-People-Places.md` §0.6.
     pub fn is_supported_image(mime_type: &str) -> bool {
         matches!(
             mime_type,
@@ -972,7 +987,11 @@ impl ThumbnailService {
             }
 
             // ── Slow path: decode, resize, re-encode to JPEG ─────────
-            let img = image::load_from_memory(&data)
+            // `decode_bounded`, not `image::load_from_memory`: this path took
+            // untrusted bytes straight into a decode with no area check,
+            // unlike `decode_oriented` below. WebP ignores `max_alloc`
+            // entirely, so the crate default was no protection here.
+            let img = crate::infrastructure::services::image_decode::decode_bounded(&data)
                 .map_err(|e| ThumbnailError::ImageError(format!("Invalid image data: {e}")))?;
 
             let (w, h) = (img.width(), img.height());
@@ -1059,6 +1078,10 @@ impl ThumbnailService {
             )));
         }
         let img =
+            // Raw `load_from_memory` is safe HERE and only here: the
+            // MAX_DECODE_PIXELS check immediately above already read the
+            // header and rejected oversized images, so routing through
+            // `decode_bounded` would re-read the dimensions for nothing.
             image::load_from_memory(data).map_err(|e| ThumbnailError::ImageError(e.to_string()))?;
         Ok(Self::apply_exif_orientation(data, img))
     }

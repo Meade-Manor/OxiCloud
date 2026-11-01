@@ -1,12 +1,45 @@
+use crate::application::dtos::display_helpers::ResourceCategory;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use super::cursor::{CursorListResponse, CursorQuery, PageCursor};
-use super::display_helpers::{classify_display, format_file_size};
+use super::display_helpers::category_for;
 use super::grant_dto::{ResourceContentDto, ResourceTypeDto};
 use crate::domain::services::authorization::ResourceKind;
+
+/// What a favorite points at. The server emits exactly these two values
+/// today; the dedicated enum (rather than the 6-value `ResourceTypeDto`)
+/// matches reality — favorites hold a file or a folder, nothing else —
+/// so clients don't have to carry impossible branches for drives,
+/// calendars, address books or playlists. If a future product decision
+/// permits favoriting one of those, add the variant here and the TS SDK
+/// surfaces it on regen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemKind {
+    File,
+    Folder,
+}
+
+impl std::str::FromStr for ItemKind {
+    type Err = String;
+
+    /// Parse the DB / wire spelling. Matches the DB CHECK constraint on
+    /// `favorites.item_type` and the handwritten FE `ItemType` union.
+    /// Unknown values are a bug — the column has a CHECK and the enum
+    /// variants are the source of truth.
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "file" => Ok(ItemKind::File),
+            "folder" => Ok(ItemKind::Folder),
+            other => Err(format!(
+                "unexpected favorite item_type: {other} (expected 'file' or 'folder')"
+            )),
+        }
+    }
+}
 
 /// DTO for favorites item, enriched with item metadata via SQL JOIN
 /// so the frontend does not need N+1 requests to resolve names/sizes.
@@ -21,8 +54,11 @@ pub struct FavoriteItemDto {
     /// ID of the favorited item (file or folder)
     pub item_id: String,
 
-    /// Type of the item ('file' or 'folder')
-    pub item_type: String,
+    /// Type of the item ('file' or 'folder'). Typed enum rather than a
+    /// raw string — the CHECK constraint on `favorites.item_type` enforces
+    /// the same invariant, and the TS SDK gets exhaustive narrowing on
+    /// the two values.
+    pub item_type: ItemKind,
 
     /// When the item was added to favorites
     pub created_at: DateTime<Utc>,
@@ -53,40 +89,25 @@ pub struct FavoriteItemDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item_path: Option<String>,
 
-    // ── Pre-computed display fields ──
-    /// FontAwesome icon CSS class (e.g. "fas fa-file-image", "fas fa-folder")
-    pub icon_class: String,
-
-    /// Extra CSS class for icon styling (e.g. "image-icon", "folder-icon")
-    pub icon_special_class: String,
-
-    /// Human-readable category (e.g. "Image", "Folder")
-    pub category: String,
-
-    /// Formatted file size (e.g. "3.27 MB"); "--" for folders
-    pub size_formatted: String,
+    // ── Pre-computed display field ──
+    /// Content category — a stable machine key, not display text (e.g.
+    /// "Image", "Folder"). See `FileDto::category`.
+    pub category: ResourceCategory,
 }
 
 impl FavoriteItemDto {
-    /// Populate display fields from the enriched metadata.
+    /// Populate the display field from the enriched metadata.
     /// Call this after constructing from the SQL row.
     pub fn with_display_fields(mut self) -> Self {
-        if self.item_type == "folder" {
-            self.icon_class = "fas fa-folder".to_string();
-            self.icon_special_class = "folder-icon".to_string();
-            self.category = "Folder".to_string();
-            self.size_formatted = "--".to_string();
+        if matches!(self.item_type, ItemKind::Folder) {
+            self.category = ResourceCategory::Folder;
         } else {
             let name = self.item_name.as_deref().unwrap_or("");
             let mime = self
                 .item_mime_type
                 .as_deref()
                 .unwrap_or("application/octet-stream");
-            let classes = classify_display(name, mime);
-            self.icon_class = classes.icon_class.to_string();
-            self.icon_special_class = classes.icon_special_class.to_string();
-            self.category = classes.category.to_string();
-            self.size_formatted = format_file_size(self.item_size.unwrap_or(0) as u64);
+            self.category = category_for(name, mime);
         }
         self
     }
@@ -153,14 +174,48 @@ pub struct FavoriteResourceRow {
     pub sort_ts: Option<DateTime<Utc>>,
 }
 
+/// Sort axis for `GET /api/favorites/resources` (§7).
+///
+/// Typed rather than `Option<String>` so an unknown axis is refused at
+/// wire-decode time instead of silently falling back to the default. See
+/// [`crate::application::dtos::trash_dto::TrashOrderBy`] for why these are
+/// per-endpoint enums rather than one shared union: the date axis is the
+/// part that differs, and favorites' is `favorited_at`, which is
+/// meaningless on every other endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FavoritesOrderBy {
+    /// Default — alphabetical, folders before files (`folder_first`).
+    #[default]
+    Name,
+    /// Grouped by kind, then alphabetical within a kind.
+    Type,
+    /// When the caller starred it, most recent first.
+    FavoritedAt,
+    /// The item's content clock (`content_modified_at`) — a rename or
+    /// move does not resurface a row, only a real content change.
+    ModifiedAt,
+    /// By byte size. Folders carry a sentinel so they cluster rather
+    /// than interleaving at zero.
+    Size,
+    /// By owner display name — favorites span drives, so this groups a
+    /// mixed list by who owns each item.
+    Owner,
+}
+
 /// Opaque keyset-pagination cursor for `GET /api/favorites/resources`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FavoritesCursor {
-    /// Sort dimension active when this cursor was produced.
-    /// Values: `"name"` (default), `"type"`, `"favorited_at"`, `"modified_at"`,
-    /// `"size"`, `"owner"`.
-    #[serde(default = "FavoritesCursor::default_order")]
-    pub order_by: String,
+    /// Sort dimension active when this cursor was produced. Typed so the
+    /// cursor's axis and the query's axis are one type and cannot drift —
+    /// the keyset predicate and the ORDER BY must name the same column or
+    /// pagination skips or repeats rows.
+    ///
+    /// Wire-compatible with the previous `String` form: snake_case
+    /// serialises to the identical token, so cursors minted before this
+    /// change still decode.
+    #[serde(default)]
+    pub order_by: FavoritesOrderBy,
     /// UUID of the last item on the previous page (tie-breaker).
     pub resource_id: Uuid,
     /// `LOWER(name)` for `name`/`type` sorts; `LOWER(username)` for `owner`.
@@ -178,12 +233,6 @@ pub struct FavoritesCursor {
     pub reverse: bool,
 }
 
-impl FavoritesCursor {
-    fn default_order() -> String {
-        "name".to_owned()
-    }
-}
-
 impl PageCursor for FavoritesCursor {}
 
 /// Query parameters for `GET /api/favorites/resources`.
@@ -194,9 +243,10 @@ pub struct FavoritesResourcesQuery {
     pub limit: u32,
     /// Opaque cursor from a previous response. Omit to start from the first page.
     pub cursor: Option<String>,
-    /// Sort / group-by dimension. Supported: `"name"` (default), `"type"`,
-    /// `"favorited_at"`, `"modified_at"`, `"size"`, `"owner"`.
-    pub order_by: Option<String>,
+    /// Sort / group-by dimension — see [`FavoritesOrderBy`]. Omit for
+    /// `name`. An unknown value is a 400 naming the accepted set, not a
+    /// silent fall back to the default.
+    pub order_by: Option<FavoritesOrderBy>,
     /// Comma-separated resource types to include, e.g. `"file,folder"`.
     /// Omit to include both.
     pub resource_types: Option<String>,
