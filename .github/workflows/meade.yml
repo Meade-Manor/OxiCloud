@@ -1,8 +1,10 @@
 # Meade Manor's build of OxiCloud: an upstream release (the `meade` branch
 # carries its tag) plus the fixes merged into `meade`, published as
 # ghcr.io/<owner>/oxicloud:<upstream version>-<commit> for Monster to pin by
-# digest. Each fix is also offered upstream; when a release carries all of
-# them, Monster goes back to the upstream image and this branch is retired.
+# digest. Our one fix, OC-FileId on the chunked-assemble MOVE, is also in
+# upstream's open pull request AtalayaLabs/OxiCloud#825 (the same header, with
+# its own tests). When a release carries it, Monster goes back to the upstream
+# image and this branch is retired.
 #
 # Upstream's own workflows stay as they are and do nothing here: their branch
 # filters name main, dev, feat/** and fix/**, and docker-publish.yml publishes
